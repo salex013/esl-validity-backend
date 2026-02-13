@@ -25,7 +25,6 @@ export function autoFix(text, meta, dashboard, rubricText = "") {
     });
   }
 
-  // Add targeted suggestions from alerts
   for (const a of dashboard.alerts || []) {
     changeLog.changes.push({
       type: "alert_flag",
@@ -43,10 +42,10 @@ function buildStandardization(meta, dashboard, changeLog) {
     `Skill: ${meta.skill} | Level: ${meta.level} | Purpose: ${meta.purpose}`,
     "",
     "Timing: Specify time limits clearly (e.g., 10–15 minutes per student / 30–45 minutes total).",
-    "Supports allowed: Clarify if notes, dictionaries, rehearsal, or repeats are permitted.",
+    "Supports allowed: Clarify if notes, dictionaries, rehearsal, repeats, or transcripts are permitted.",
     "Prompt delivery: Use the same prompts/conditions for all students (or equivalent versions).",
     "Scoring guidance: Score performance evidence, not effort. Use descriptors consistently.",
-    "Accommodations: Provide reasonable accommodations as required (extra time, alternate format, assistive tech).",
+    "Accommodations: Provide accommodations as required (extra time, alternate format, assistive tech).",
     "",
     "Washback tip: Encourage strategy practice (planning, monitoring, self-correction), not memorization-only."
   ];
@@ -57,7 +56,6 @@ function buildStandardization(meta, dashboard, changeLog) {
     action: "Inserted an administration notes block."
   });
 
-  // If construct contamination flagged, add an explicit note
   if (dashboard.signals?.contamination) {
     lines.push("");
     lines.push("Construct note: Reduce unrelated reading/writing demands so the task measures the intended skill.");
@@ -117,7 +115,3 @@ function cleanRubricText(rubricText, changeLog) {
       why: "Replacing vague descriptors improves inter-rater reliability.",
       action: "Converted vague adjectives into observable language."
     });
-  }
-
-  return out.trim();
-}
