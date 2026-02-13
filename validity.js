@@ -1,4 +1,3 @@
-// validity.js
 const CATEGORIES = {
   construct: { label: "Construct Validity", weight: 3 },
   content: { label: "Content Validity", weight: 3 },
