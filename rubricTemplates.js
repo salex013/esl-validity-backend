@@ -15,34 +15,34 @@ function speaking(meta) {
     bands: ["4 - Exceeds", "3 - Meets", "2 - Approaches", "1 - Needs Work"],
     criteria: [
       { name:"Task Achievement", levels:[
-        "Fully addresses the task; responses are detailed and relevant; meaning is consistently clear.",
-        "Addresses the task; responses are mostly relevant; meaning is clear with minor lapses.",
-        "Partially addresses the task; some responses are unclear or off-topic; meaning sometimes breaks down.",
-        "Does not address the task adequately; responses are minimal or unclear; meaning often breaks down."
+        "Fully addresses the task; detailed and relevant; meaning consistently clear.",
+        "Addresses the task; mostly relevant; meaning clear with minor lapses.",
+        "Partially addresses the task; some unclear/off-topic; meaning sometimes breaks down.",
+        "Does not address the task adequately; minimal/unclear; meaning often breaks down."
       ]},
       { name:"Fluency & Coherence", levels:[
-        "Speech flows naturally; ideas are logically connected; uses linking words effectively.",
-        "Generally smooth; some pauses; ideas are mostly organized; uses basic linking words.",
-        "Frequent pauses; ideas may be repetitive or loosely connected; limited linking words.",
-        "Very hesitant; hard to follow; limited ability to connect ideas."
+        "Flows naturally; ideas logically connected; linking words used effectively.",
+        "Generally smooth; some pauses; mostly organized; basic linking words used.",
+        "Frequent pauses; ideas loosely connected; limited linking words.",
+        "Very hesitant; hard to follow; minimal ability to connect ideas."
       ]},
       { name:"Vocabulary", levels:[
-        "Uses a range of topic vocabulary; word choice supports precise meaning; occasional minor errors.",
-        "Uses appropriate topic vocabulary; meaning is usually clear; some imprecise word choice.",
-        "Limited range; repetitive word choice; meaning sometimes unclear due to word choice.",
+        "Range of topic vocabulary; precise meaning; minor errors only.",
+        "Appropriate topic vocabulary; meaning usually clear; some imprecision.",
+        "Limited range; repetitive; meaning sometimes unclear due to word choice.",
         "Very limited vocabulary; frequent breakdowns in meaning."
       ]},
       { name:"Grammar Control", levels:[
-        "Uses a variety of structures; errors are minor and rarely affect meaning.",
-        "Uses basic structures with some variety; errors occur but meaning remains clear.",
-        "Frequent errors in basic structures; errors sometimes interfere with meaning.",
-        "Persistent errors; meaning is often difficult to understand."
+        "Variety of structures; errors minor and rarely affect meaning.",
+        "Mostly correct basic structures; some errors but meaning remains clear.",
+        "Frequent errors in basic structures; sometimes interfere with meaning.",
+        "Persistent errors; meaning often difficult to understand."
       ]},
       { name:"Pronunciation", levels:[
-        "Mostly easy to understand; pronunciation supports communication; minor issues do not interfere.",
-        "Generally understandable; occasional strain for listener; meaning remains mostly clear.",
-        "Often difficult to understand; frequent mispronunciations affect comprehension.",
-        "Very difficult to understand; listener frequently cannot follow meaning."
+        "Mostly easy to understand; minor issues do not interfere.",
+        "Generally understandable; occasional listener strain; meaning mostly clear.",
+        "Often difficult to understand; mispronunciations affect comprehension.",
+        "Very difficult to understand; listener frequently cannot follow."
       ]}
     ]
   };
@@ -54,31 +54,31 @@ function writing(meta) {
     bands: ["4 - Exceeds", "3 - Meets", "2 - Approaches", "1 - Needs Work"],
     criteria: [
       { name:"Task Achievement", levels:[
-        "Fully addresses purpose and audience; ideas are developed with relevant details.",
-        "Addresses purpose and audience; ideas have some development and support.",
-        "Partially addresses purpose; limited development; some irrelevant or unclear ideas.",
+        "Fully addresses purpose/audience; ideas developed with relevant detail.",
+        "Addresses purpose/audience; ideas have some development and support.",
+        "Partially addresses purpose; limited development; some unclear ideas.",
         "Does not address purpose; minimal or unclear ideas."
       ]},
       { name:"Organization", levels:[
-        "Clear structure; paragraphs/sections are logical; linking words guide the reader.",
-        "Mostly organized; some minor issues; uses basic transitions.",
-        "Organization is inconsistent; weak transitions; reader may get confused.",
+        "Clear structure; logical paragraphs; transitions guide the reader.",
+        "Mostly organized; minor issues; basic transitions used.",
+        "Inconsistent organization; weak transitions; reader confusion at times.",
         "Little organization; hard to follow; minimal transitions."
       ]},
       { name:"Vocabulary", levels:[
-        "Uses a range of appropriate vocabulary; word choice supports precise meaning.",
-        "Uses appropriate vocabulary; occasional repetition or imprecise word choice.",
-        "Limited vocabulary; frequent repetition; imprecision affects clarity.",
-        "Very limited vocabulary; meaning is often unclear."
+        "Range of appropriate vocabulary; precise word choice supports meaning.",
+        "Appropriate vocabulary; some repetition or imprecision.",
+        "Limited vocabulary; frequent repetition; clarity affected.",
+        "Very limited vocabulary; meaning often unclear."
       ]},
       { name:"Grammar", levels:[
-        "Varied sentence forms; errors are minor and rarely affect understanding.",
-        "Mostly correct basic structures; some errors but meaning remains clear.",
-        "Frequent errors; errors sometimes interfere with meaning.",
+        "Varied sentence forms; errors minor and rarely affect understanding.",
+        "Basic structures mostly correct; errors but meaning remains clear.",
+        "Frequent errors; sometimes interfere with meaning.",
         "Persistent errors; meaning often unclear."
       ]},
       { name:"Mechanics", levels:[
-        "Minor spelling/punctuation errors; readability is strong.",
+        "Minor spelling/punctuation errors; readability strong.",
         "Some errors; generally readable.",
         "Frequent errors; readability affected.",
         "Errors significantly reduce readability."
@@ -127,7 +127,7 @@ function reading(meta) {
       ]},
       { name:"Details & Inference", levels:[
         "Accurately locates details and makes reasonable inferences.",
-        "Finds many details; inferences are sometimes weak.",
+        "Finds many details; inferences sometimes weak.",
         "Finds limited details; inferences often incorrect.",
         "Struggles to locate details or infer meaning."
       ]},
