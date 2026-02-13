@@ -1,83 +1,87 @@
 const express = require("express");
 const cors = require("cors");
-const helmet = require("helmet");
-const morgan = require("morgan");
 
 const { scoreAssessment } = require("./validity");
-const { buildAssessmentPackDocxBuffer } = require("./autofix");
+const { buildAssessmentPackDocxBuffer } = require("./docxBuild");
+const { createRuleBasedRewrite, createAIRewrite } = require("./autofix");
 
 const app = express();
 
-// --- Config ---
-const PORT = process.env.PORT || 10000;
-
-// If you want to lock this down later, replace "*" with your Netlify domain.
-app.use(cors({ origin: "*" }));
-app.use(helmet());
-app.use(morgan("tiny"));
+// Render/Netlify friendly
+app.use(cors());
 app.use(express.json({ limit: "2mb" }));
 
-// --- Routes ---
-app.get("/api/health", (req, res) => {
+// --- Health + build tags (handy for debugging deploys)
+app.get("/api/health", (_req, res) => {
   res.json({ ok: true, name: "ESL Validity Tool Backend" });
 });
 
-app.get("/api/build", (req, res) => {
-  res.json({ ok: true, build: "esl-validity-backend-autofix-pack-v1-2026-02-13" });
+app.get("/api/build", (_req, res) => {
+  res.json({ ok: true, build: "esl-validity-backend-ai-pack-v1-2026-02-13" });
 });
 
-// Score route (JSON)
+// --- Score route (POST)
 app.post("/api/score", (req, res) => {
   try {
-    const { extractedText = "", meta = {}, rubricText = "" } = req.body || {};
-    const result = scoreAssessment({ extractedText, meta, rubricText });
+    const { extractedText = "", rubricText = "", meta = {} } = req.body || {};
+    const result = scoreAssessment({ extractedText, rubricText, meta });
     res.json(result);
   } catch (err) {
-    res.status(500).json({ error: "score_failed", message: err?.message || "Unknown error" });
+    console.error("Score error:", err);
+    res.status(500).json({ ok: false, error: "Scoring failed." });
   }
 });
 
-// Autofix route (returns downloadable DOCX "Assessment Pack")
+// Friendly messages if someone hits GET in the browser
+app.get("/api/score", (_req, res) => {
+  res
+    .status(405)
+    .send("Use POST /api/score with JSON { extractedText, rubricText, meta }");
+});
+
+// --- Autofix → returns a downloadable DOCX pack (original + rule + AI)
 app.post("/api/autofix", async (req, res) => {
   try {
-    const { extractedText = "", meta = {}, rubricText = "" } = req.body || {};
-    if (!String(extractedText).trim()) {
-      return res.status(400).json({
-        error: "missing_extractedText",
-        message: "Assessment instructions text is required."
-      });
-    }
+    const { extractedText = "", rubricText = "", meta = {} } = req.body || {};
 
-    // Use the same scoring engine to decide what to fix-first
-    const score = scoreAssessment({ extractedText, meta, rubricText });
+    // 1) Rule-based rewrite (always available)
+    const rule = createRuleBasedRewrite({ extractedText, rubricText, meta });
 
-    const buffer = await buildAssessmentPackDocxBuffer({
+    // 2) AI rewrite (optional; falls back if no key)
+    const ai = await createAIRewrite({
       extractedText,
       rubricText,
       meta,
-      score
+      ruleFallback: rule
     });
 
-    const safeSkill = (meta?.skill || "Skill").toString().replace(/[^a-z0-9_-]+/gi, "-");
-    const safeLevel = (meta?.level || "Level").toString().replace(/[^a-z0-9_-]+/gi, "-");
-    const filename = `Assessment-Pack_${safeSkill}_${safeLevel}.docx`;
+    const packBuffer = await buildAssessmentPackDocxBuffer({
+      meta,
+      original: { extractedText, rubricText },
+      rule,
+      ai
+    });
 
+    const filename = "Assessment Pack.docx";
     res.setHeader(
       "Content-Type",
       "application/vnd.openxmlformats-officedocument.wordprocessingml.document"
     );
     res.setHeader("Content-Disposition", `attachment; filename="${filename}"`);
-    res.send(buffer);
+    res.send(packBuffer);
   } catch (err) {
-    res.status(500).json({ error: "autofix_failed", message: err?.message || "Unknown error" });
+    console.error("Autofix error:", err);
+    res.status(500).json({ ok: false, error: "Autofix pack generation failed." });
   }
 });
 
-// Root (nice message)
-app.get("/", (req, res) => {
-  res.type("text").send("ESL Validity Tool Backend is running. Try /api/health");
+app.get("/api/autofix", (_req, res) => {
+  res
+    .status(405)
+    .send("Use POST /api/autofix with JSON { extractedText, rubricText, meta }");
 });
 
+const PORT = process.env.PORT || 10000;
 app.listen(PORT, () => {
-  console.log(`Server listening on port ${PORT}`);
+  console.log("Server listening on port", PORT);
 });
