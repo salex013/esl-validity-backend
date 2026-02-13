@@ -1,124 +1,83 @@
-import express from "express";
-import cors from "cors";
-import multer from "multer";
+const express = require("express");
+const cors = require("cors");
+const helmet = require("helmet");
+const morgan = require("morgan");
 
-import { extractDocxText } from "./extract.js";
-import { buildDashboard } from "./validity.js";
-import { autoFix } from "./autofix.js";
-import { buildDocx } from "./docxBuild.js";
-
-const BUILD_ID = "esl-validity-backend-score-route-v1-2026-02-13";
+const { scoreAssessment } = require("./validity");
+const { buildAssessmentPackDocxBuffer } = require("./autofix");
 
 const app = express();
-app.use(cors());
-app.use(express.json({ limit: "10mb" }));
 
-const upload = multer({
-  storage: multer.memoryStorage(),
-  limits: { fileSize: 10 * 1024 * 1024 }
-});
+// --- Config ---
+const PORT = process.env.PORT || 10000;
 
+// If you want to lock this down later, replace "*" with your Netlify domain.
+app.use(cors({ origin: "*" }));
+app.use(helmet());
+app.use(morgan("tiny"));
+app.use(express.json({ limit: "2mb" }));
+
+// --- Routes ---
 app.get("/api/health", (req, res) => {
   res.json({ ok: true, name: "ESL Validity Tool Backend" });
 });
 
-// PROVE WHAT CODE IS DEPLOYED
 app.get("/api/build", (req, res) => {
-  res.json({ ok: true, build: BUILD_ID });
+  res.json({ ok: true, build: "esl-validity-backend-autofix-pack-v1-2026-02-13" });
 });
 
-/**
- * Upload + extract DOCX to raw text
- * FormData: file
- * Returns: { extractedText }
- */
-app.post("/api/upload", upload.single("file"), async (req, res) => {
+// Score route (JSON)
+app.post("/api/score", (req, res) => {
   try {
-    if (!req.file) return res.status(400).json({ error: "No file uploaded." });
-    if (!String(req.file.originalname || "").toLowerCase().endsWith(".docx")) {
-      return res.status(400).json({ error: "Please upload a .docx file." });
-    }
-
-    const result = await extractDocxText(req.file.buffer);
-    res.json({ extractedText: result.text });
+    const { extractedText = "", meta = {}, rubricText = "" } = req.body || {};
+    const result = scoreAssessment({ extractedText, meta, rubricText });
+    res.json(result);
   } catch (err) {
-    console.error(err);
-    res.status(500).json({ error: "Extraction failed." });
+    res.status(500).json({ error: "score_failed", message: err?.message || "Unknown error" });
   }
 });
 
-/**
- * Server-authored dashboard scoring
- * Body: { extractedText, meta, rubricText? }
- * Returns: dashboard JSON
- */
-app.post("/api/score", async (req, res) => {
+// Autofix route (returns downloadable DOCX "Assessment Pack")
+app.post("/api/autofix", async (req, res) => {
   try {
-    const { extractedText, meta, rubricText } = req.body || {};
-
-    if (!extractedText || typeof extractedText !== "string") {
-      return res.status(400).json({ error: "Missing extractedText." });
-    }
-    if (!meta || !meta.skill || !meta.level || !meta.purpose) {
-      return res.status(400).json({ error: "Missing meta (skill, level, purpose)." });
-    }
-
-    const dashboard = buildDashboard(extractedText, meta, rubricText || "");
-    res.json(dashboard);
-  } catch (err) {
-    console.error(err);
-    res.status(500).json({ error: "Scoring failed." });
-  }
-});
-
-/**
- * Generate improved DOCX using server dashboard + autofix
- * Body: { extractedText, meta, rubricText? }
- * Returns: DOCX file. Also sets X-Dashboard-Base64 header.
- */
-app.post("/api/revise", async (req, res) => {
-  try {
-    const { extractedText, meta, rubricText } = req.body || {};
-
-    if (!extractedText || typeof extractedText !== "string") {
-      return res.status(400).json({ error: "Missing extractedText." });
-    }
-    if (!meta || !meta.skill || !meta.level || !meta.purpose) {
-      return res.status(400).json({ error: "Missing meta (skill, level, purpose)." });
+    const { extractedText = "", meta = {}, rubricText = "" } = req.body || {};
+    if (!String(extractedText).trim()) {
+      return res.status(400).json({
+        error: "missing_extractedText",
+        message: "Assessment instructions text is required."
+      });
     }
 
-    const dashboard = buildDashboard(extractedText, meta, rubricText || "");
-    const fix = autoFix(extractedText, meta, dashboard, rubricText || "");
+    // Use the same scoring engine to decide what to fix-first
+    const score = scoreAssessment({ extractedText, meta, rubricText });
 
-    const buffer = await buildDocx(meta, fix, dashboard);
+    const buffer = await buildAssessmentPackDocxBuffer({
+      extractedText,
+      rubricText,
+      meta,
+      score
+    });
 
-    // Provide dashboard for UI to decode if desired
-    const dashB64 = Buffer.from(JSON.stringify(dashboard), "utf8").toString("base64");
-    res.setHeader("X-Dashboard-Base64", dashB64);
+    const safeSkill = (meta?.skill || "Skill").toString().replace(/[^a-z0-9_-]+/gi, "-");
+    const safeLevel = (meta?.level || "Level").toString().replace(/[^a-z0-9_-]+/gi, "-");
+    const filename = `Assessment-Pack_${safeSkill}_${safeLevel}.docx`;
 
     res.setHeader(
       "Content-Type",
       "application/vnd.openxmlformats-officedocument.wordprocessingml.document"
     );
-    res.setHeader(
-      "Content-Disposition",
-      `attachment; filename="Improved_Assessment_${safe(meta.skill)}_${safe(meta.level)}.docx"`
-    );
-
+    res.setHeader("Content-Disposition", `attachment; filename="${filename}"`);
     res.send(buffer);
   } catch (err) {
-    console.error(err);
-    res.status(500).json({ error: "Revision failed." });
+    res.status(500).json({ error: "autofix_failed", message: err?.message || "Unknown error" });
   }
 });
 
-const PORT = process.env.PORT || 3000;
-app.listen(PORT, () => console.log(`✅ Server running on port ${PORT} (${BUILD_ID})`));
+// Root (nice message)
+app.get("/", (req, res) => {
+  res.type("text").send("ESL Validity Tool Backend is running. Try /api/health");
+});
 
-function safe(s) {
-  return String(s || "")
-    .replace(/[^a-z0-9-_ ]/gi, "")
-    .trim()
-    .replace(/\s+/g, "_")
-    .slice(0, 40) || "NA";
-}
+app.listen(PORT, () => {
+  console.log(`Server listening on port ${PORT}`);
+});
