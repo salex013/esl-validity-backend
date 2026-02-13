@@ -1,208 +1,153 @@
-// validity.js
-// Lightweight heuristic scoring for ESL assessment validity.
-// Deterministic + transparent (no LLM calls).
-
-function clamp01(n) {
-  if (Number.isNaN(n)) return 0;
-  return Math.max(0, Math.min(1, n));
+function clamp(n, min, max) {
+  return Math.max(min, Math.min(max, n));
 }
 
-function pct(n) {
-  return clamp01(n);
+function toText(x) {
+  return (x || "").toString().trim();
 }
 
 function hasAny(text, needles) {
-  const t = (text || "").toLowerCase();
+  const t = text.toLowerCase();
   return needles.some((n) => t.includes(n));
 }
 
-function countAny(text, needles) {
-  const t = (text || "").toLowerCase();
-  let c = 0;
-  for (const n of needles) if (t.includes(n)) c++;
-  return c;
+function pct(n) {
+  return clamp(Math.round(n), 0, 100);
 }
 
-function extractCriteria(rubricText) {
-  const t = (rubricText || "").replace(/\s+/g, " ").trim();
-  // Try "Criteria:" list
-  const m = t.match(/criteria\s*:\s*([^\.]+)\./i);
-  if (m && m[1]) {
-    return m[1].split(",").map((s) => s.trim()).filter(Boolean).slice(0, 10);
-  }
-  // Fallback: comma-separated first line
-  const firstLine = (rubricText || "")
-    .split("\n")
-    .map((x) => x.trim())
-    .filter(Boolean)[0] || "";
-  const parts = firstLine.split(",").map((s) => s.trim()).filter(Boolean);
-  if (parts.length >= 2 && parts.length <= 10) return parts.slice(0, 10);
-  return [];
-}
+function scoreAssessment({ extractedText, rubricText, meta }) {
+  const task = toText(extractedText);
+  const rubric = toText(rubricText);
 
-function scoreAssessment({ extractedText, meta, rubricText }) {
-  const task = (extractedText || "").trim();
-  const rubric = (rubricText || "").trim();
   const skill = (meta?.skill || "").toString();
   const level = (meta?.level || "").toString();
   const purpose = (meta?.purpose || "").toString();
 
-  // Signals
-  const hasRubric = !!rubric;
-  const hasTime = hasAny(task, ["minute", "minutes", "min", "time:", "timed", "duration"]);
-  const hasOutcomes = hasAny(task + " " + rubric, [
-    "clb",
-    "can do",
-    "learning outcome",
-    "outcome",
-    "benchmark",
-    "descriptor"
-  ]);
-  const hasAccom = hasAny(task + " " + rubric, [
-    "accommodation",
-    "accommodations",
-    "extra time",
-    "assistive",
-    "alternative format",
-    "accessibility",
-    "aoda"
-  ]);
-  const vague =
-    countAny(task + " " + rubric, [
-      "good",
-      "nice",
-      "better",
-      "best",
-      "excellent",
-      "ok",
-      "adequate",
-      "poor"
-    ]) >= 3;
+  // Signals (very explainable / heuristic — good for teacher-facing tools)
+  const signals = {
+    hasRubric: rubric.length > 20,
+    hasTime: hasAny(task, ["minute", "minutes", "min", "time:", "timed", "duration"]),
+    hasOutcomes: hasAny(task + " " + rubric, ["clb", "canadian language benchmarks", "learning outcome", "outcome:", "descriptor"]),
+    hasAccom: hasAny(task + " " + rubric, ["accommodation", "accommodations", "extra time", "support", "alternate format", "assistive", "caption", "screen reader"]),
+    vague: !hasAny(task, ["you will", "students will", "task:", "instructions", "steps", "deliver", "record", "write", "present", "submit"]) || task.length < 80,
+    contamination: hasAny(task, ["essay", "academic paragraph", "research paper", "citations"]) && (skill.toLowerCase().includes("speaking") || skill.toLowerCase().includes("listening"))
+  };
 
-  const contamination =
-    skill.toLowerCase() === "speaking"
-      ? hasAny(task, ["write", "paragraph", "essay", "reading passage"])
-      : skill.toLowerCase() === "writing"
-        ? hasAny(task, ["presentation", "oral", "speaking"])
-        : false;
+  // Category scores (higher = better)
+  // Start from 50 and add/subtract using signals.
+  let construct = 50;
+  if (signals.hasOutcomes) construct += 15;
+  if (!signals.vague) construct += 10;
+  if (signals.contamination) construct -= 20;
+  if (!signals.hasRubric) construct -= 15;
 
-  const signals = { hasRubric, hasTime, hasOutcomes, hasAccom, vague, contamination };
+  let content = 50;
+  if (signals.hasOutcomes) content += 20;
+  if (signals.hasRubric) content += 10;
+  if (task.length > 200) content += 5;
+  if (signals.vague) content -= 15;
 
-  // Category scoring (0..1)
-  let construct = 0.65;
-  if (!skill) construct -= 0.1;
-  if (!hasOutcomes) construct -= 0.15;
-  if (contamination) construct -= 0.25;
-  if (purpose.toLowerCase() === "placement") construct -= 0.05;
+  let reliability = 50;
+  if (signals.hasRubric) reliability += 20;
+  if (hasAny(rubric, ["level", "4", "3", "2", "1", "meets", "approaches", "exceeds"])) reliability += 10;
+  if (hasAny(rubric, ["clear", "specific", "observable"])) reliability += 5;
+  if (!signals.hasRubric) reliability -= 25;
+  if (signals.vague) reliability -= 10;
+
+  let washback = 50;
+  // positive washback cues
+  if (hasAny(task, ["draft", "revise", "self-check", "peer feedback", "practice", "reflection"])) washback += 15;
+  // negative washback cues
+  if (hasAny(task, ["memorize", "no notes", "no practice"])) washback -= 10;
+
+  let fairness = 50;
+  if (signals.hasAccom) fairness += 25;
+  if (hasAny(task + " " + rubric, ["plain language", "examples", "model", "visual", "rubric shared"])) fairness += 10;
+  if (!signals.hasAccom) fairness -= 15;
+
+  let practicality = 50;
+  if (signals.hasTime) practicality += 15;
+  if (hasAny(task, ["materials", "resources", "technology needed", "room setup"])) practicality += 10;
+  if (task.length > 1200) practicality -= 10;
+
   construct = pct(construct);
-
-  let content = 0.7;
-  if (!hasOutcomes) content -= 0.2;
-  if (task.length < 80) content -= 0.1;
-  if (rubric && rubric.length < 80) content -= 0.05;
   content = pct(content);
-
-  let reliability = 0.6;
-  if (!hasRubric) reliability -= 0.25;
-  if (!hasTime) reliability -= 0.1;
-  if (vague) reliability -= 0.15;
   reliability = pct(reliability);
-
-  let washback = 0.35;
-  if (hasAny(task + " " + rubric, ["strategy", "self-correction", "reflection", "draft", "revise", "practice"]))
-    washback += 0.25;
-  if (purpose.toLowerCase() === "formative") washback += 0.15;
   washback = pct(washback);
-
-  let fairness = 0.7;
-  if (!hasAccom) fairness -= 0.25;
-  if (hasAny(task, ["only", "must", "no help", "no support"]) && purpose.toLowerCase() !== "placement")
-    fairness -= 0.1;
   fairness = pct(fairness);
-
-  let practicality = 0.45;
-  if (hasTime) practicality += 0.15;
-  if (hasAny(task, ["materials:", "resources:", "record", "device"])) practicality += 0.1;
   practicality = pct(practicality);
 
-  const cats = [
-    { key: "Construct Validity", pct: construct },
-    { key: "Content Validity", pct: content },
-    { key: "Reliability", pct: reliability },
-    { key: "Washback", pct: washback },
-    { key: "Fairness & Accessibility", pct: fairness },
-    { key: "Practicality", pct: practicality }
-  ];
-
-  // Overall risk: weighted average of "risk" (1 - pct)
-  const weights = {
-    "Construct Validity": 0.25,
-    "Content Validity": 0.2,
-    "Reliability": 0.2,
-    "Washback": 0.1,
-    "Fairness & Accessibility": 0.15,
-    "Practicality": 0.1
+  const categoryScores = {
+    constructValidity: construct,
+    contentValidity: content,
+    reliability,
+    washback,
+    fairnessAccessibility: fairness,
+    practicality
   };
 
-  let risk = 0;
-  let wsum = 0;
-  for (const c of cats) {
-    const w = weights[c.key] || 0;
-    risk += (1 - c.pct) * w;
-    wsum += w;
-  }
-  const overallRiskPct = wsum ? clamp01(risk / wsum) : 0.5;
+  // Overall trust score: weighted
+  const trustScore = pct(
+    0.22 * construct +
+      0.22 * content +
+      0.20 * reliability +
+      0.14 * fairness +
+      0.12 * practicality +
+      0.10 * washback
+  );
 
-  // Trust score (0..100)
-  let trustScore = Math.round((1 - overallRiskPct) * 100);
-  if (!hasRubric) trustScore -= 8;
-  if (!hasOutcomes) trustScore -= 8;
-  if (contamination) trustScore -= 6;
-  if (!hasAccom) trustScore -= 6;
-  trustScore = Math.max(0, Math.min(100, trustScore));
+  // Overall risk = inverse trust + penalties for key red flags
+  let overallRiskPct = 100 - trustScore;
+  if (!signals.hasRubric) overallRiskPct += 10;
+  if (!signals.hasOutcomes) overallRiskPct += 10;
+  if (!signals.hasAccom) overallRiskPct += 6;
+  if (signals.contamination) overallRiskPct += 8;
+  overallRiskPct = pct(overallRiskPct);
 
-  let overallLabel = "good";
-  if (trustScore < 70) overallLabel = "needs_tuning";
-  if (trustScore < 50) overallLabel = "high_concern";
+  const overallLabel =
+    trustScore >= 80 ? "strong" :
+    trustScore >= 65 ? "moderate" :
+    trustScore >= 50 ? "needs_tuning" :
+    "high_concern";
 
   const alerts = [];
-  if (contamination) alerts.push("Construct contamination risk (task may measure unintended skills).");
-  if (!hasOutcomes) alerts.push("Alignment unclear (add outcomes/CLB descriptors explicitly).");
-  if (!hasRubric || vague) alerts.push("Reliability risk (rubric missing or descriptors too vague).");
-  if (!hasAccom) alerts.push("Fairness/accessibility risk (add accommodations/alternate formats).");
+  if (signals.contamination) alerts.push("Construct contamination risk (task may measure unintended skills).");
+  if (!signals.hasOutcomes) alerts.push("Alignment unclear (add outcomes/CLB descriptors explicitly).");
+  if (!signals.hasRubric || reliability < 60) alerts.push("Reliability risk (rubric missing or descriptors too vague).");
+  if (!signals.hasAccom || fairness < 60) alerts.push("Fairness/accessibility risk (add accommodations/alternate formats).");
+  if (!signals.hasTime) alerts.push("Practicality risk (time/duration not specified).");
 
-  const fixMap = {
-    "Construct Validity":
-      "Reduce extra skill load that isn’t central to the target construct; simplify prompts or allow oral delivery.",
-    "Content Validity":
-      "Add explicit CLB/learning outcome links (in the task + rubric headings) and ensure coverage matches the construct.",
-    "Reliability":
-      "Tighten descriptors (observable behaviors), standardize admin conditions, and add clear scoring rules/examples.",
-    "Washback":
-      "Add practice-oriented criteria (strategies, reflection) and feedback guidance aligned to the learning goals.",
-    "Fairness & Accessibility":
-      "Add accommodations statement + clarify supports allowed; consider alternate formats and flexible timing.",
-    "Practicality":
-      "Specify time, materials, and steps; streamline administration and scoring."
-  };
+  // “Fix first” = lowest 3 categories with short guidance
+  const fixMap = [
+    { key: "contentValidity", label: "Content Validity", note: "Add explicit CLB/learning outcome links (in task + rubric headings)." },
+    { key: "fairnessAccessibility", label: "Fairness & Accessibility", note: "Add accommodations/alternate formats statement + clarify supports allowed." },
+    { key: "constructValidity", label: "Construct Validity", note: "Reduce reading/writing load that isn’t central to the target skill; simplify prompts." },
+    { key: "reliability", label: "Reliability", note: "Make rubric descriptors observable; add anchors/examples; reduce ambiguous wording." },
+    { key: "washback", label: "Washback", note: "Add practice + feedback loop (draft → revise → reflect) to encourage learning-focused behaviors." },
+    { key: "practicality", label: "Practicality", note: "Specify time, materials, administration steps, and scoring time expectations." }
+  ];
 
-  const fixFirst = [...cats]
-    .sort((a, b) => a.pct - b.pct)
-    .slice(0, 3)
-    .map((c) => ({ name: c.key, note: fixMap[c.key] }));
+  const sorted = [...fixMap].sort((a, b) => categoryScores[a.key] - categoryScores[b.key]);
+  const fixFirst = sorted.slice(0, 3).map((x) => `${x.label} — ${x.note}`);
 
-  const criteria = extractCriteria(rubricText);
-
+  // Handy “dashboard payload”
   return {
+    ok: true,
     meta: { skill, level, purpose },
     trustScore,
     overallLabel,
     overallRiskPct,
+    categoryScores: {
+      "Construct Validity": construct,
+      "Content Validity": content,
+      "Reliability": reliability,
+      "Washback": washback,
+      "Fairness & Accessibility": fairness,
+      "Practicality": practicality
+    },
     alerts,
-    cats,
     fixFirst,
-    signals,
-    extracted: { criteria }
+    signals
   };
 }
 
