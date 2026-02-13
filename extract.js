@@ -2,7 +2,6 @@ import mammoth from "mammoth";
 
 export async function extractDocxText(buffer) {
   const result = await mammoth.extractRawText({ buffer });
-  return {
-    text: result.value.trim()
-  };
+  const text = (result.value || "").replace(/\r/g, "").trim();
+  return { text };
 }
