@@ -26,7 +26,7 @@ export function buildDashboard(text, meta = {}, rubricText = "") {
     (skill === "speaking" && readingHeavy) ||
     (skill === "listening" && writingHeavy);
 
-  // Category riskPct (0..1) — v1 heuristics
+  // Risk (0..1)
   const construct = clamp01((contamination ? 0.75 : 0.15) + (/(instructions|task|you will)/.test(combined) ? 0 : 0.15));
   const content = clamp01((hasOutcomes ? 0.15 : 0.70) + (/unit|lesson|topic|theme/.test(combined) ? 0 : 0.10));
   const reliability = clamp01((hasRubric ? 0.15 : 0.75) + (vague ? 0.45 : 0));
@@ -95,25 +95,25 @@ function fixSuggestion(cat, s) {
   }
   if (cat === "Content Validity") {
     return !s.hasOutcomes
-      ? "Add explicit CLB/learning outcome links (in the doc + rubric headings)."
+      ? "Add explicit CLB/learning outcome links (in the task + rubric headings)."
       : "Check task sampling: does it reflect what was practiced in class?";
   }
   if (cat === "Reliability") {
     return (!s.hasRubric || s.vague)
       ? "Use analytic rubric with observable descriptors (replace ‘good/clear/strong’ with evidence-based language)."
-      : "Add scoring notes + standardize prompt conditions for consistency.";
+      : "Add scorer notes + standardize conditions for consistency.";
   }
   if (cat === "Washback") {
-    return "Add preparation guidance that promotes strategy practice (planning, self-correction) instead of memorization-only.";
+    return "Add prep guidance that promotes strategy practice (planning, monitoring, self-correction) instead of memorization-only.";
   }
   if (cat === "Fairness & Accessibility") {
     return !s.hasAccom
       ? "Add accommodations/alternate formats statement + clarify supports allowed."
-      : "Check cultural/tech load and ensure instructions are plain-language for the level.";
+      : "Check cultural/tech load and keep instructions plain-language for the level.";
   }
   if (cat === "Practicality") {
     return !s.hasTime
-      ? "Specify timing + administration conditions to reduce variability and workload surprises."
+      ? "Specify timing + admin conditions to reduce variability and workload surprises."
       : "Confirm scoring time is realistic (consider checklist + short analytic rubric).";
   }
   return "Refine this category based on flagged risks.";
