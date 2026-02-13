@@ -1,56 +1,169 @@
-const CATEGORIES = {
-  construct: { label: "Construct Validity", weight: 3 },
-  content: { label: "Content Validity", weight: 3 },
-  reliability: { label: "Reliability", weight: 2 },
-  washback: { label: "Washback", weight: 2 },
-  fairness: { label: "Fairness & Accessibility", weight: 2 },
-  practicality: { label: "Practicality", weight: 1 }
-};
+// validity.js
+// Lightweight heuristic scoring for ESL assessment validity.
+// Deterministic + transparent (no LLM calls).
 
-export function buildDashboard(text, meta = {}, rubricText = "") {
-  const combined = `${text}\n\n${rubricText}`.toLowerCase();
+function clamp01(n) {
+  if (Number.isNaN(n)) return 0;
+  return Math.max(0, Math.min(1, n));
+}
 
-  const hasRubric = /rubric|criteria|descriptor|level|band/.test(combined);
-  const hasTime = /time|minutes|min\./.test(combined);
-  const hasOutcomes =
-    /clb|cefr|learning outcome|outcome|benchmark/.test(combined) ||
-    (meta.courseOutcomes || "").trim().length > 0;
-  const hasAccom = /accommodation|accessibility|alternate format|extra time/.test(combined);
-  const vague = /\b(good|clear|strong|effective|appropriate)\b/.test(combined);
+function pct(n) {
+  return clamp01(n);
+}
 
-  const readingHeavy = /read (the following|the passage)|paragraph|article|essay/.test(combined);
-  const writingHeavy = /write (a paragraph|an essay|full sentences)|justify your answers|explain in writing/.test(combined);
+function hasAny(text, needles) {
+  const t = (text || "").toLowerCase();
+  return needles.some((n) => t.includes(n));
+}
 
-  const skill = (meta.skill || "").toLowerCase();
+function countAny(text, needles) {
+  const t = (text || "").toLowerCase();
+  let c = 0;
+  for (const n of needles) if (t.includes(n)) c++;
+  return c;
+}
+
+function extractCriteria(rubricText) {
+  const t = (rubricText || "").replace(/\s+/g, " ").trim();
+  // Try "Criteria:" list
+  const m = t.match(/criteria\s*:\s*([^\.]+)\./i);
+  if (m && m[1]) {
+    return m[1].split(",").map((s) => s.trim()).filter(Boolean).slice(0, 10);
+  }
+  // Fallback: comma-separated first line
+  const firstLine = (rubricText || "")
+    .split("\n")
+    .map((x) => x.trim())
+    .filter(Boolean)[0] || "";
+  const parts = firstLine.split(",").map((s) => s.trim()).filter(Boolean);
+  if (parts.length >= 2 && parts.length <= 10) return parts.slice(0, 10);
+  return [];
+}
+
+function scoreAssessment({ extractedText, meta, rubricText }) {
+  const task = (extractedText || "").trim();
+  const rubric = (rubricText || "").trim();
+  const skill = (meta?.skill || "").toString();
+  const level = (meta?.level || "").toString();
+  const purpose = (meta?.purpose || "").toString();
+
+  // Signals
+  const hasRubric = !!rubric;
+  const hasTime = hasAny(task, ["minute", "minutes", "min", "time:", "timed", "duration"]);
+  const hasOutcomes = hasAny(task + " " + rubric, [
+    "clb",
+    "can do",
+    "learning outcome",
+    "outcome",
+    "benchmark",
+    "descriptor"
+  ]);
+  const hasAccom = hasAny(task + " " + rubric, [
+    "accommodation",
+    "accommodations",
+    "extra time",
+    "assistive",
+    "alternative format",
+    "accessibility",
+    "aoda"
+  ]);
+  const vague =
+    countAny(task + " " + rubric, [
+      "good",
+      "nice",
+      "better",
+      "best",
+      "excellent",
+      "ok",
+      "adequate",
+      "poor"
+    ]) >= 3;
+
   const contamination =
-    (skill === "speaking" && readingHeavy) ||
-    (skill === "listening" && writingHeavy);
+    skill.toLowerCase() === "speaking"
+      ? hasAny(task, ["write", "paragraph", "essay", "reading passage"])
+      : skill.toLowerCase() === "writing"
+        ? hasAny(task, ["presentation", "oral", "speaking"])
+        : false;
 
-  // Risk (0..1)
-  const construct = clamp01((contamination ? 0.75 : 0.15) + (/(instructions|task|you will)/.test(combined) ? 0 : 0.15));
-  const content = clamp01((hasOutcomes ? 0.15 : 0.70) + (/unit|lesson|topic|theme/.test(combined) ? 0 : 0.10));
-  const reliability = clamp01((hasRubric ? 0.15 : 0.75) + (vague ? 0.45 : 0));
-  const washback = clamp01((/memorize|script|recite/.test(combined) ? 0.70 : 0.20) + (/feedback|revise|improve|reflection/.test(combined) ? 0 : 0.10));
-  const fairness = clamp01((hasAccom ? 0.20 : 0.70) + (/instructions/.test(combined) ? 0 : 0.10));
-  const practicality = clamp01((hasTime ? 0.20 : 0.40));
+  const signals = { hasRubric, hasTime, hasOutcomes, hasAccom, vague, contamination };
 
-  const weights = { construct:3, content:3, reliability:2, washback:2, fairness:2, practicality:1 };
-  const weightedRisk =
-    construct*weights.construct +
-    content*weights.content +
-    reliability*weights.reliability +
-    washback*weights.washback +
-    fairness*weights.fairness +
-    practicality*weights.practicality;
+  // Category scoring (0..1)
+  let construct = 0.65;
+  if (!skill) construct -= 0.1;
+  if (!hasOutcomes) construct -= 0.15;
+  if (contamination) construct -= 0.25;
+  if (purpose.toLowerCase() === "placement") construct -= 0.05;
+  construct = pct(construct);
 
-  const maxWeighted = Object.values(weights).reduce((a,b)=>a+b,0);
-  const overallRiskPct = weightedRisk / maxWeighted;
-  const trustScore = Math.round(100 * (1 - overallRiskPct));
+  let content = 0.7;
+  if (!hasOutcomes) content -= 0.2;
+  if (task.length < 80) content -= 0.1;
+  if (rubric && rubric.length < 80) content -= 0.05;
+  content = pct(content);
 
-  const overallLabel =
-    trustScore >= 80 ? "strong" :
-    trustScore >= 60 ? "needs_tuning" :
-    trustScore >= 40 ? "moderate_concern" : "high_concern";
+  let reliability = 0.6;
+  if (!hasRubric) reliability -= 0.25;
+  if (!hasTime) reliability -= 0.1;
+  if (vague) reliability -= 0.15;
+  reliability = pct(reliability);
+
+  let washback = 0.35;
+  if (hasAny(task + " " + rubric, ["strategy", "self-correction", "reflection", "draft", "revise", "practice"]))
+    washback += 0.25;
+  if (purpose.toLowerCase() === "formative") washback += 0.15;
+  washback = pct(washback);
+
+  let fairness = 0.7;
+  if (!hasAccom) fairness -= 0.25;
+  if (hasAny(task, ["only", "must", "no help", "no support"]) && purpose.toLowerCase() !== "placement")
+    fairness -= 0.1;
+  fairness = pct(fairness);
+
+  let practicality = 0.45;
+  if (hasTime) practicality += 0.15;
+  if (hasAny(task, ["materials:", "resources:", "record", "device"])) practicality += 0.1;
+  practicality = pct(practicality);
+
+  const cats = [
+    { key: "Construct Validity", pct: construct },
+    { key: "Content Validity", pct: content },
+    { key: "Reliability", pct: reliability },
+    { key: "Washback", pct: washback },
+    { key: "Fairness & Accessibility", pct: fairness },
+    { key: "Practicality", pct: practicality }
+  ];
+
+  // Overall risk: weighted average of "risk" (1 - pct)
+  const weights = {
+    "Construct Validity": 0.25,
+    "Content Validity": 0.2,
+    "Reliability": 0.2,
+    "Washback": 0.1,
+    "Fairness & Accessibility": 0.15,
+    "Practicality": 0.1
+  };
+
+  let risk = 0;
+  let wsum = 0;
+  for (const c of cats) {
+    const w = weights[c.key] || 0;
+    risk += (1 - c.pct) * w;
+    wsum += w;
+  }
+  const overallRiskPct = wsum ? clamp01(risk / wsum) : 0.5;
+
+  // Trust score (0..100)
+  let trustScore = Math.round((1 - overallRiskPct) * 100);
+  if (!hasRubric) trustScore -= 8;
+  if (!hasOutcomes) trustScore -= 8;
+  if (contamination) trustScore -= 6;
+  if (!hasAccom) trustScore -= 6;
+  trustScore = Math.max(0, Math.min(100, trustScore));
+
+  let overallLabel = "good";
+  if (trustScore < 70) overallLabel = "needs_tuning";
+  if (trustScore < 50) overallLabel = "high_concern";
 
   const alerts = [];
   if (contamination) alerts.push("Construct contamination risk (task may measure unintended skills).");
@@ -58,65 +171,39 @@ export function buildDashboard(text, meta = {}, rubricText = "") {
   if (!hasRubric || vague) alerts.push("Reliability risk (rubric missing or descriptors too vague).");
   if (!hasAccom) alerts.push("Fairness/accessibility risk (add accommodations/alternate formats).");
 
-  const cats = [
-    { key: CATEGORIES.construct.label, pct: construct },
-    { key: CATEGORIES.content.label, pct: content },
-    { key: CATEGORIES.reliability.label, pct: reliability },
-    { key: CATEGORIES.washback.label, pct: washback },
-    { key: CATEGORIES.fairness.label, pct: fairness },
-    { key: CATEGORIES.practicality.label, pct: practicality },
-  ];
+  const fixMap = {
+    "Construct Validity":
+      "Reduce extra skill load that isn’t central to the target construct; simplify prompts or allow oral delivery.",
+    "Content Validity":
+      "Add explicit CLB/learning outcome links (in the task + rubric headings) and ensure coverage matches the construct.",
+    "Reliability":
+      "Tighten descriptors (observable behaviors), standardize admin conditions, and add clear scoring rules/examples.",
+    "Washback":
+      "Add practice-oriented criteria (strategies, reflection) and feedback guidance aligned to the learning goals.",
+    "Fairness & Accessibility":
+      "Add accommodations statement + clarify supports allowed; consider alternate formats and flexible timing.",
+    "Practicality":
+      "Specify time, materials, and steps; streamline administration and scoring."
+  };
 
   const fixFirst = [...cats]
-    .sort((a,b)=>b.pct - a.pct)
-    .slice(0,3)
-    .map(c => ({
-      name: c.key,
-      note: fixSuggestion(c.key, { contamination, hasOutcomes, hasRubric, vague, hasAccom, hasTime })
-    }));
+    .sort((a, b) => a.pct - b.pct)
+    .slice(0, 3)
+    .map((c) => ({ name: c.key, note: fixMap[c.key] }));
+
+  const criteria = extractCriteria(rubricText);
 
   return {
-    meta,
+    meta: { skill, level, purpose },
     trustScore,
     overallLabel,
     overallRiskPct,
     alerts,
     cats,
     fixFirst,
-    signals: { hasRubric, hasTime, hasOutcomes, hasAccom, vague, contamination }
+    signals,
+    extracted: { criteria }
   };
 }
 
-function fixSuggestion(cat, s) {
-  if (cat === "Construct Validity") {
-    return s.contamination
-      ? "Reduce reading/writing load that isn’t central to the target skill; simplify prompts or deliver orally."
-      : "Confirm scoring focuses on the intended skill (avoid over-weighting grammar for communicative tasks).";
-  }
-  if (cat === "Content Validity") {
-    return !s.hasOutcomes
-      ? "Add explicit CLB/learning outcome links (in the task + rubric headings)."
-      : "Check task sampling: does it reflect what was practiced in class?";
-  }
-  if (cat === "Reliability") {
-    return (!s.hasRubric || s.vague)
-      ? "Use analytic rubric with observable descriptors (replace ‘good/clear/strong’ with evidence-based language)."
-      : "Add scorer notes + standardize conditions for consistency.";
-  }
-  if (cat === "Washback") {
-    return "Add prep guidance that promotes strategy practice (planning, monitoring, self-correction) instead of memorization-only.";
-  }
-  if (cat === "Fairness & Accessibility") {
-    return !s.hasAccom
-      ? "Add accommodations/alternate formats statement + clarify supports allowed."
-      : "Check cultural/tech load and keep instructions plain-language for the level.";
-  }
-  if (cat === "Practicality") {
-    return !s.hasTime
-      ? "Specify timing + admin conditions to reduce variability and workload surprises."
-      : "Confirm scoring time is realistic (consider checklist + short analytic rubric).";
-  }
-  return "Refine this category based on flagged risks.";
-}
-
-function clamp01(x){ return Math.max(0, Math.min(1, x)); }
+module.exports = { scoreAssessment };
