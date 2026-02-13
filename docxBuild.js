@@ -32,6 +32,12 @@ export async function buildDocx(meta, fix, dashboard) {
   }
 
   children.push(spacer());
+  children.push(new Paragraph({ text: "Fix First (Top 3)", heading: HeadingLevel.HEADING_2 }));
+  for (const f of dashboard.fixFirst || []) {
+    children.push(p(`• ${f.name}: ${f.note}`));
+  }
+
+  children.push(spacer());
   children.push(new Paragraph({ text: "Standardization & Administration Notes", heading: HeadingLevel.HEADING_2 }));
   children.push(...blockToParas(fix.standardization));
 
