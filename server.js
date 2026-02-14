@@ -1,15 +1,15 @@
 const express = require("express");
 const cors = require("cors");
 
-const validityRouter = require("./validity"); // POST /api/validity
-const autofixRouter = require("./autofix");   // POST /api/autofix
+const validityRouter = require("./validity"); // router.post("/")
+const autofixRouter = require("./autofix");   // router.post("/")
 
 const app = express();
 
 app.use(cors());
 app.use(express.json({ limit: "5mb" }));
 
-// Health checks
+// Health
 app.get("/", (req, res) => res.send("OK"));
 app.get("/health", (req, res) => res.json({ ok: true }));
 app.get("/api/health", (req, res) => {
@@ -20,24 +20,13 @@ app.get("/api/health", (req, res) => {
   });
 });
 
-// Primary routes
+// ✅ Primary routes
 app.use("/api/validity", validityRouter);
 app.use("/api/autofix", autofixRouter);
 
-// Aliases (older frontend naming)
-app.post("/api/report", (req, res, next) => {
-  if (!req.body.extractedText && req.body.instructionsText) {
-    req.body.extractedText = req.body.instructionsText;
-  }
-  return validityRouter(req, res, next); // router is middleware
-});
-
-app.post("/api/fix", (req, res, next) => {
-  if (!req.body.extractedText && req.body.instructionsText) {
-    req.body.extractedText = req.body.instructionsText;
-  }
-  return autofixRouter(req, res, next);
-});
+// ✅ Aliases (THIS is the key fix)
+app.use("/api/report", validityRouter); // POST /api/report -> same router
+app.use("/api/fix", autofixRouter);     // POST /api/fix -> same router
 
 // Debug helper
 app.get("/api/routes", (req, res) => {
