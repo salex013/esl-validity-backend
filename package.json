@@ -2,7 +2,7 @@
   "name": "esl-validity-backend",
   "version": "1.0.0",
   "private": true,
-  "description": "ESL Assessment Validity Checker backend",
+  "description": "ESL Assessment Validity Checker Backend (report + autofix → DOCX ZIP)",
   "main": "server.js",
   "type": "commonjs",
   "scripts": {
