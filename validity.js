@@ -1,138 +1,99 @@
 const express = require("express");
+const OpenAI = require("openai");
+
 const router = express.Router();
 
-/**
- * POST /api/validity
- * Body example:
- * {
- *   "skill": "Speaking",
- *   "levelFramework": "CLB",
- *   "level": "5",
- *   "purpose": "Summative",
- *   "instructionsText": "...",   // or extractedText
- *   "rubricText": "..."
- * }
- */
+// POST "/" so it works for BOTH:
+// - /api/validity/
+// - /api/report/
 router.post("/", async (req, res) => {
   try {
+    const apiKey = process.env.OPENAI_API_KEY;
+    if (!apiKey) {
+      return res.status(500).json({ ok: false, error: "Missing OPENAI_API_KEY" });
+    }
+
+    const client = new OpenAI({ apiKey });
+
     const {
       skill,
       levelFramework,
       level,
       purpose,
       instructionsText,
-      extractedText,
       rubricText,
+      extractedText, // allow either name
     } = req.body || {};
 
-    const text = extractedText || instructionsText || "";
-    if (!text.trim()) {
-      return res.status(400).json({ ok: false, error: "Missing extractedText/instructionsText" });
-    }
+    const instructions = extractedText || instructionsText || "";
 
-    // If you want OpenAI on/off quickly:
-    const apiKey = process.env.OPENAI_API_KEY;
-    const model = process.env.OPENAI_MODEL || "gpt-4o-mini";
-
-    // If no API key, still return a helpful response (so endpoint works)
-    if (!apiKey) {
-      return res.json({
-        ok: true,
-        warning: "OPENAI_API_KEY not set on server. Returning fallback report.",
-        report: {
-          summary: "No AI analysis (missing API key).",
-          quickChecks: [
-            "Instructions received ✅",
-            "Rubric received " + (rubricText ? "✅" : "⚠️"),
-          ],
-          suggestedFixes: [
-            "Set OPENAI_API_KEY in Render Environment.",
-          ],
-        },
+    if (!skill || !levelFramework || !level || !purpose || !instructions || !rubricText) {
+      return res.status(400).json({
+        ok: false,
+        error:
+          "Missing required fields. Required: skill, levelFramework, level, purpose, instructionsText (or extractedText), rubricText",
       });
     }
 
-    const system = `
-You are an ESL assessment validity checker. 
-Return STRICT JSON only. No markdown. No extra commentary.
+    const prompt = `
+You are an ESL assessment validity checker.
 
-You will evaluate:
-- Alignment between instructions and rubric
-- CLB/CEFR appropriateness given skill + level
-- Clarity, task validity, fairness, accessibility
-
-Return this JSON shape:
+Return STRICT JSON with keys:
 {
   "summary": string,
-  "alignmentScore": number, 
-  "issues": [{ "type": string, "severity": "low"|"medium"|"high", "detail": string }],
-  "suggestedImprovements": [string],
-  "accessibilityNotes": [string]
+  "alignment": {
+    "skillMatch": "strong|partial|weak",
+    "levelMatch": "strong|partial|weak",
+    "purposeMatch": "strong|partial|weak",
+    "rubricMatch": "strong|partial|weak"
+  },
+  "issues": [{"severity":"high|medium|low","issue":string,"whyItMatters":string,"fixSuggestion":string}],
+  "quickFixes": [string],
+  "revisedInstructions": string
 }
+
+Context:
+Skill: ${skill}
+Framework: ${levelFramework}
+Level: ${level}
+Purpose: ${purpose}
+
+Instructions:
+${instructions}
+
+Rubric:
+${rubricText}
 `.trim();
 
-    const user = `
-Skill: ${skill || "Unknown"}
-Framework: ${levelFramework || "Unknown"}
-Level: ${level || "Unknown"}
-Purpose: ${purpose || "Unknown"}
-
-INSTRUCTIONS:
-${text}
-
-RUBRIC:
-${rubricText || "(none provided)"}
-`.trim();
-
-    // Call OpenAI Chat Completions via fetch (works on Node 18+)
-    const response = await fetch("https://api.openai.com/v1/chat/completions", {
-      method: "POST",
-      headers: {
-        "Authorization": `Bearer ${apiKey}`,
-        "Content-Type": "application/json",
-      },
-      body: JSON.stringify({
-        model,
-        temperature: 0.2,
-        messages: [
-          { role: "system", content: system },
-          { role: "user", content: user },
-        ],
-      }),
+    const completion = await client.chat.completions.create({
+      model: process.env.OPENAI_MODEL || "gpt-4o-mini",
+      messages: [
+        { role: "system", content: "You output ONLY valid JSON. No markdown. No commentary." },
+        { role: "user", content: prompt },
+      ],
+      temperature: 0.2,
     });
 
-    if (!response.ok) {
-      const errText = await response.text().catch(() => "");
-      return res.status(500).json({
+    const text = completion.choices?.[0]?.message?.content || "";
+
+    // Try to parse JSON safely
+    let data;
+    try {
+      data = JSON.parse(text);
+    } catch (e) {
+      return res.status(502).json({
         ok: false,
-        error: "OpenAI request failed",
-        status: response.status,
-        details: errText.slice(0, 1000),
+        error: "OpenAI returned non-JSON output",
+        raw: text,
       });
     }
 
-    const data = await response.json();
-    const content = data?.choices?.[0]?.message?.content || "";
-
-    // Try to parse strict JSON
-    let report;
-    try {
-      report = JSON.parse(content);
-    } catch {
-      // If the model ever returns extra text, recover gracefully
-      report = {
-        summary: "AI returned non-JSON output. See raw.",
-        alignmentScore: 0,
-        issues: [{ type: "format", severity: "high", detail: "Model did not return valid JSON." }],
-        suggestedImprovements: [],
-        accessibilityNotes: [],
-        raw: content,
-      };
-    }
-
-    return res.json({ ok: true, report });
+    return res.json({ ok: true, report: data });
   } catch (err) {
-    return res.status(500).json({ ok: false, error: err.message || String(err) });
+    return res.status(500).json({
+      ok: false,
+      error: err?.message || "Server error",
+    });
   }
 });
 
