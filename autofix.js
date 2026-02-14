@@ -1,106 +1,91 @@
 const express = require("express");
-const archiver = require("archiver");
-const { Document, Packer, Paragraph, TextRun } = require("docx");
+const OpenAI = require("openai");
 
 const router = express.Router();
 
-/**
- * POST /api/autofix
- * Returns: ZIP (report.json + fixed.docx)
- *
- * Body:
- * {
- *   "instructionsText": "...", // or extractedText
- *   "rubricText": "...",
- *   "skill": "...",
- *   "levelFramework": "CLB"|"CEFR",
- *   "level": "5",
- *   "purpose": "Summative"
- * }
- */
+// POST "/" so it works for BOTH:
+// - /api/autofix/
+// - /api/fix/
 router.post("/", async (req, res) => {
   try {
+    const apiKey = process.env.OPENAI_API_KEY;
+    if (!apiKey) {
+      return res.status(500).json({ ok: false, error: "Missing OPENAI_API_KEY" });
+    }
+
+    const client = new OpenAI({ apiKey });
+
     const {
       skill,
       levelFramework,
       level,
       purpose,
       instructionsText,
-      extractedText,
       rubricText,
+      extractedText,
     } = req.body || {};
 
-    const text = extractedText || instructionsText || "";
-    if (!text.trim()) {
-      return res.status(400).json({ ok: false, error: "Missing extractedText/instructionsText" });
+    const instructions = extractedText || instructionsText || "";
+
+    if (!skill || !levelFramework || !level || !purpose || !instructions || !rubricText) {
+      return res.status(400).json({
+        ok: false,
+        error:
+          "Missing required fields. Required: skill, levelFramework, level, purpose, instructionsText (or extractedText), rubricText",
+      });
     }
 
-    // (Optional) if you want autofix to use AI too, you can reuse OPENAI_API_KEY here.
-    // For now: a simple “fixed” version by adding structure headers.
-    const fixedText =
-`ASSESSMENT INSTRUCTIONS (REVISED)
+    const prompt = `
+You are an ESL assessment fixer.
 
-Skill: ${skill || "Unknown"}
-Framework/Level: ${levelFramework || "Unknown"} ${level || ""}
-Purpose: ${purpose || "Unknown"}
+Return STRICT JSON with keys:
+{
+  "fixedInstructions": string,
+  "fixedRubric": string,
+  "changes": [string]
+}
 
-1) Task
-${text.trim()}
+Context:
+Skill: ${skill}
+Framework: ${levelFramework}
+Level: ${level}
+Purpose: ${purpose}
 
-2) Success Criteria (based on rubric)
-${rubricText ? rubricText.trim() : "(No rubric provided — add criteria here.)"}
+Original Instructions:
+${instructions}
 
-3) Submission
-- Include your name and student ID.
-- Submit by the deadline posted in SLATE.
-`;
+Original Rubric:
+${rubricText}
+`.trim();
 
-    const report = {
-      ok: true,
-      name: "Autofix Package",
-      timestamp: new Date().toISOString(),
-      notes: [
-        "This ZIP includes a revised instruction docx + a JSON report file.",
+    const completion = await client.chat.completions.create({
+      model: process.env.OPENAI_MODEL || "gpt-4o-mini",
+      messages: [
+        { role: "system", content: "You output ONLY valid JSON. No markdown. No commentary." },
+        { role: "user", content: prompt },
       ],
-    };
-
-    // Build DOCX
-    const doc = new Document({
-      sections: [
-        {
-          children: fixedText.split("\n").map((line) =>
-            new Paragraph({
-              children: [new TextRun(line)],
-            })
-          ),
-        },
-      ],
+      temperature: 0.2,
     });
 
-    const docxBuffer = await Packer.toBuffer(doc);
+    const text = completion.choices?.[0]?.message?.content || "";
 
-    // Stream ZIP back
-    res.setHeader("Content-Type", "application/zip");
-    res.setHeader("Content-Disposition", 'attachment; filename="autofix.zip"');
+    let data;
+    try {
+      data = JSON.parse(text);
+    } catch (e) {
+      return res.status(502).json({
+        ok: false,
+        error: "OpenAI returned non-JSON output",
+        raw: text,
+      });
+    }
 
-    const archive = archiver("zip", { zlib: { level: 9 } });
-
-    archive.on("error", (err) => {
-      // If archiver errors mid-stream
-      try {
-        res.status(500).end();
-      } catch {}
-      console.error(err);
-    });
-
-    archive.pipe(res);
-
-    archive.append(JSON.stringify(report, null, 2), { name: "report.json" });
-    archive.append(docxBuffer, { name: "fixed.docx" });
-
-    await archive.finalize();
+    return res.json({ ok: true, fix: data });
   } catch (err) {
-    return res.status(500).json({ ok: false, error: err.message || String(err) });
+    return res.status(500).json({
+      ok: false,
+      error: err?.message || "Server error",
+    });
   }
 });
 
