@@ -2,12 +2,11 @@
   "name": "esl-validity-backend",
   "version": "1.0.0",
   "private": true,
-  "description": "ESL Assessment Validity Checker backend (report + fix -> DOCX ZIP)",
+  "description": "ESL Assessment Validity Checker backend (report + fix → DOCX ZIP)",
   "main": "server.js",
   "type": "commonjs",
   "scripts": {
-    "start": "node server.js",
-    "dev": "nodemon server.js"
+    "start": "node server.js"
   },
   "engines": {
     "node": ">=18"
@@ -17,8 +16,5 @@
     "cors": "^2.8.5",
     "docx": "^9.5.1",
     "express": "^4.19.2"
-  },
-  "devDependencies": {
-    "nodemon": "^3.0.3"
   }
 }
