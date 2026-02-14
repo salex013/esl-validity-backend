@@ -2,7 +2,7 @@
   "name": "esl-validity-backend",
   "version": "1.0.0",
   "private": true,
-  "description": "ESL Assessment Validity Checker backend (report + fix → DOCX ZIP)",
+  "description": "ESL Assessment Validity Checker backend (report + fix)",
   "main": "server.js",
   "type": "commonjs",
   "scripts": {
@@ -12,9 +12,8 @@
     "node": ">=18"
   },
   "dependencies": {
-    "archiver": "^7.0.1",
     "cors": "^2.8.5",
-    "docx": "^9.5.1",
-    "express": "^4.19.2"
+    "express": "^4.19.2",
+    "openai": "^4.0.0"
   }
 }
