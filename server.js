@@ -1,21 +1,18 @@
-// server.js (FULL FIXED - no validity-lite required)
-
 const express = require("express");
 const cors = require("cors");
 
-const validityRouter = require("./validity"); // POST /api/validity
-const autofixRouter = require("./autofix");   // POST /api/autofix
+const runValidity = require("./validity");
+const runAutofix = require("./autofix");
 
 const app = express();
 
 app.use(cors());
 app.use(express.json({ limit: "5mb" }));
 
-// Root + health checks
+// Root
 app.get("/", (req, res) => res.send("OK"));
 
-app.get("/health", (req, res) => res.json({ ok: true }));
-
+// Health
 app.get("/api/health", (req, res) => {
   res.json({
     ok: true,
@@ -24,41 +21,60 @@ app.get("/api/health", (req, res) => {
   });
 });
 
-// Primary routes
-app.use("/api/validity", validityRouter);
-app.use("/api/autofix", autofixRouter);
-
-// ✅ Aliases for your frontend / older naming
-// /api/report -> same handler as /api/validity
-// /api/fix    -> same handler as /api/autofix
-app.post("/api/report", (req, res, next) => {
-  // allow either extractedText OR instructionsText
-  if (!req.body.extractedText && req.body.instructionsText) {
-    req.body.extractedText = req.body.instructionsText;
+// 🔹 VALIDITY
+app.post("/api/validity", async (req, res) => {
+  try {
+    const result = await runValidity(req.body);
+    res.json({ ok: true, report: result });
+  } catch (err) {
+    console.error("VALIDITY ERROR:", err);
+    res.status(500).json({ ok: false, error: err.message });
   }
-  return validityRouter.handle(req, res, next);
 });
 
-app.post("/api/fix", (req, res, next) => {
-  if (!req.body.extractedText && req.body.instructionsText) {
-    req.body.extractedText = req.body.instructionsText;
+// Alias
+app.post("/api/report", async (req, res) => {
+  try {
+    const result = await runValidity(req.body);
+    res.json({ ok: true, report: result });
+  } catch (err) {
+    console.error("REPORT ERROR:", err);
+    res.status(500).json({ ok: false, error: err.message });
   }
-  return autofixRouter.handle(req, res, next);
 });
 
-// Debug helper: see what routes exist
+// 🔹 AUTOFIX
+app.post("/api/autofix", async (req, res) => {
+  try {
+    const result = await runAutofix(req.body);
+    res.json({ ok: true, fix: result });
+  } catch (err) {
+    console.error("AUTOFIX ERROR:", err);
+    res.status(500).json({ ok: false, error: err.message });
+  }
+});
+
+// Alias
+app.post("/api/fix", async (req, res) => {
+  try {
+    const result = await runAutofix(req.body);
+    res.json({ ok: true, fix: result });
+  } catch (err) {
+    console.error("FIX ERROR:", err);
+    res.status(500).json({ ok: false, error: err.message });
+  }
+});
+
+// Debug
 app.get("/api/routes", (req, res) => {
   res.json({
     routes: [
-      "GET /",
-      "GET /health",
       "GET /api/health",
-      "GET /api/routes",
       "POST /api/validity",
-      "POST /api/report (alias of /api/validity)",
+      "POST /api/report",
       "POST /api/autofix",
-      "POST /api/fix (alias of /api/autofix)",
-    ],
+      "POST /api/fix"
+    ]
   });
 });
 
