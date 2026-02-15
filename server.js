@@ -1,220 +1,192 @@
-require("dotenv").config();
+// src/server.js
+
+// Load .env locally only (Render already provides env vars)
+if (process.env.NODE_ENV !== "production") {
+  require("dotenv").config();
+}
+
 const express = require("express");
 const cors = require("cors");
+
 const { callGroq, liteValidity } = require("./llm");
 
 const app = express();
+
+// ---- Config ----
 const PORT = process.env.PORT || 10000;
 
+// Set these in Render Environment:
+// GROQ_API_KEY=...
+// ADMIN_KEY=...
+const GROQ_API_KEY = process.env.GROQ_API_KEY || "";
+const ADMIN_KEY = process.env.ADMIN_KEY || "";
+
+// ---- Middleware ----
 app.use(cors());
-app.use(express.json({ limit: "5mb" }));
+app.use(express.json({ limit: "2mb" }));
 
-// In-memory history store (simple + safe for now)
-const history = [];
+// ---- Helpers ----
+function ok(res, payload = {}) {
+  return res.json({ ok: true, ...payload });
+}
+function fail(res, status, message, extra = {}) {
+  return res.status(status).json({ ok: false, error: message, ...extra });
+}
 
-/* ==============================
-   HEALTH
-============================== */
+function isAdmin(req) {
+  const xAdmin = req.header("x-admin-key");
+  const auth = req.header("authorization") || "";
+  const bearer = auth.toLowerCase().startsWith("bearer ") ? auth.slice(7).trim() : "";
+  const token = xAdmin || bearer;
+  return Boolean(ADMIN_KEY && token && token === ADMIN_KEY);
+}
+
+// ---- Routes ----
 app.get("/api/health", (req, res) => {
-  res.json({
-    ok: true,
+  ok(res, {
     name: "ESL Validity Tool Backend",
-    groqConfigured: !!process.env.GROQ_API_KEY,
-    adminConfigured: !!process.env.ADMIN_KEY
+    timestamp: new Date().toISOString(),
+    groqConfigured: Boolean(GROQ_API_KEY),
+    adminConfigured: Boolean(ADMIN_KEY)
   });
 });
 
-/* ==============================
-   VALIDITY REPORT
-============================== */
-app.post("/api/report", async (req, res) => {
-  try {
-    const {
-      skill,
-      levelFramework,
-      level,
-      purpose,
-      instructionsText,
-      rubricText,
-      mode = "lite"
-    } = req.body;
-
-    let result;
-
-    if (mode === "groq") {
-      if (!process.env.GROQ_API_KEY) {
-        return res.status(500).json({
-          ok: false,
-          error: "Groq not configured on server."
-        });
-      }
-
-      const messages = [
-        {
-          role: "system",
-          content:
-            "You are an ESL assessment validity expert. Provide structured JSON output only."
-        },
-        {
-          role: "user",
-          content: `
-Skill: ${skill}
-Framework: ${levelFramework}
-Level: ${level}
-Purpose: ${purpose}
-
-Instructions:
-${instructionsText}
-
-Rubric:
-${rubricText}
-
-Evaluate validity (clarity, alignment, measurability).
-Return structured JSON.
-`
-        }
-      ];
-
-      const content = await callGroq({
-        apiKey: process.env.GROQ_API_KEY,
-        messages
-      });
-
-      try {
-        result = JSON.parse(content);
-      } catch {
-        result = { mode: "groq", raw: content };
-      }
-    } else {
-      result = liteValidity({
-        skill,
-        levelFramework,
-        level,
-        purpose,
-        instructionsText,
-        rubricText
-      });
-    }
-
-    history.unshift({
-      id: Date.now(),
-      createdAt: new Date().toISOString(),
-      skill,
-      levelFramework,
-      level,
-      purpose,
-      result
-    });
-
-    res.json({ ok: true, result });
-
-  } catch (err) {
-    console.error(err);
-    res.status(500).json({ ok: false, error: "Server error" });
-  }
+app.get("/api/routes", (req, res) => {
+  ok(res, {
+    routes: [
+      "GET /api/health",
+      "GET /api/routes",
+      "POST /api/report",
+      "POST /api/report?mode=lite",
+      "GET /api/history?limit=20 (admin)"
+    ]
+  });
 });
 
-/* ==============================
-   DESIGN ASSESSMENT
-============================== */
-app.post("/api/design", async (req, res) => {
+/**
+ * POST /api/report
+ * Body:
+ * {
+ *   skill, levelFramework, level, purpose,
+ *   instructionsText, rubricText,
+ *   title?, criteriaFocus? (optional)
+ * }
+ *
+ * Query:
+ *   mode=lite  -> forces lite
+ */
+app.post("/api/report", async (req, res) => {
+  const {
+    skill,
+    levelFramework,
+    level,
+    purpose,
+    instructionsText,
+    rubricText,
+    title = "",
+    criteriaFocus = "" // optional: validity/reliability/washback/etc.
+  } = req.body || {};
+
+  const mode = (req.query.mode || "").toLowerCase();
+  const forceLite = mode === "lite";
+
+  // Basic validation
+  if (!skill || !levelFramework || !level || !purpose) {
+    return fail(res, 400, "Missing required fields: skill, levelFramework, level, purpose.");
+  }
+  if (!instructionsText || !rubricText) {
+    return fail(res, 400, "Missing required fields: instructionsText and rubricText.");
+  }
+
+  // If no Groq key or mode forced -> lite
+  if (forceLite || !GROQ_API_KEY) {
+    const report = liteValidity({ skill, levelFramework, level, purpose, instructionsText, rubricText });
+    return ok(res, { report });
+  }
+
+  // Groq mode
   try {
-    const {
-      skill,
-      levelFramework,
-      level,
-      purpose,
-      idea
-    } = req.body;
+    const system = `
+You are an ESL/EAP assessment specialist.
+Your job: evaluate an assessment's validity quality and provide actionable improvements.
 
-    if (!process.env.GROQ_API_KEY) {
-      return res.status(500).json({
-        ok: false,
-        error: "Groq not configured."
-      });
-    }
+Return STRICT JSON with keys:
+mode, summary, strengths[], issues[], suggestions[], scores{clarity,alignment,measurability,fairness_accessibility}, overall{band,label}, riskLevel, metadata.
 
-    const messages = [
-      {
-        role: "system",
-        content:
-          "You are an ESL assessment design expert. Create strong, valid assessment instructions and rubric."
-      },
-      {
-        role: "user",
-        content: `
-Design an ESL assessment.
+Scoring: 1 (weak) to 4 (strong).
+overall.band: 1-4, label: Approaches/Meets/Exceeds.
+riskLevel: low/medium/high.
+    `.trim();
 
+    const user = `
+ASSESSMENT CONTEXT
+Title: ${title}
 Skill: ${skill}
 Framework: ${levelFramework}
 Level: ${level}
 Purpose: ${purpose}
+Focus: ${criteriaFocus}
 
-Teacher idea:
-${idea}
+STUDENT INSTRUCTIONS
+${instructionsText}
 
-Ensure validity, reliability, positive washback.
-Return structured JSON with:
-- instructions
-- rubric (3-5 criteria with levels)
-`
-      }
-    ];
+RUBRIC
+${rubricText}
+    `.trim();
 
     const content = await callGroq({
-      apiKey: process.env.GROQ_API_KEY,
-      messages
+      apiKey: GROQ_API_KEY,
+      model: "llama-3.1-8b-instant",
+      temperature: 0.2,
+      messages: [
+        { role: "system", content: system },
+        { role: "user", content: user }
+      ]
     });
 
     let parsed;
     try {
       parsed = JSON.parse(content);
     } catch {
-      parsed = { raw: content };
+      // If Groq returns non-JSON, fall back to lite with a warning
+      const report = liteValidity({ skill, levelFramework, level, purpose, instructionsText, rubricText });
+      report.mode = "lite";
+      report.summary = "Groq returned non-JSON. Returned lite checks instead.";
+      return ok(res, { report });
     }
 
-    res.json({ ok: true, result: parsed });
+    // Ensure a minimum shape
+    parsed.mode = parsed.mode || "groq";
+    parsed.metadata = parsed.metadata || { skill, levelFramework, level, purpose };
 
+    return ok(res, { report: parsed });
   } catch (err) {
-    console.error(err);
-    res.status(500).json({ ok: false, error: "Design error" });
+    // If Groq fails for any reason, fallback to lite
+    const report = liteValidity({ skill, levelFramework, level, purpose, instructionsText, rubricText });
+    report.mode = "lite";
+    report.summary = "Groq failed; returned lite checks instead.";
+    return ok(res, { report, groqError: err?.message || "Unknown error" });
   }
 });
 
-/* ==============================
-   EXTRACT TEXT (placeholder)
-============================== */
-app.post("/api/extract", async (req, res) => {
-  res.json({
-    ok: true,
-    message: "Text extraction endpoint placeholder."
-  });
-});
-
-/* ==============================
-   ADMIN HISTORY
-============================== */
+/**
+ * Admin history endpoint (simple placeholder)
+ * GET /api/history?limit=5
+ *
+ * This version returns an empty list unless you later add persistence.
+ */
 app.get("/api/history", (req, res) => {
-  const adminKey =
-    req.header("x-admin-key") ||
-    (req.header("authorization") || "").replace("Bearer ", "");
-
-  if (!adminKey || adminKey !== process.env.ADMIN_KEY) {
-    return res.status(401).json({ ok: false, error: "Unauthorized" });
-  }
-
-  const limit = parseInt(req.query.limit || "20", 10);
-
-  res.json({
-    ok: true,
-    count: history.length,
-    items: history.slice(0, limit)
-  });
+  if (!isAdmin(req)) return fail(res, 401, "Unauthorized");
+  const limit = Math.max(1, Math.min(50, Number(req.query.limit || 20)));
+  ok(res, { count: 0, items: [], limit });
 });
 
-/* ==============================
-   START
-============================== */
+// Root
+app.get("/", (req, res) => {
+  res.type("text").send("ESL Validity Tool Backend is running. Try /api/health");
+});
+
+// ---- Start ----
 app.listen(PORT, () => {
   console.log(`Server running on port ${PORT}`);
 });
