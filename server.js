@@ -1,8 +1,8 @@
 const express = require("express");
 const cors = require("cors");
 
-const validityRouter = require("./validity"); // router.post("/")
-const autofixRouter = require("./autofix");   // router.post("/")
+const validityRouter = require("./validity"); // POST /api/validity
+const autofixRouter = require("./autofix");   // POST /api/autofix
 
 const app = express();
 
@@ -20,19 +20,32 @@ app.get("/api/health", (req, res) => {
   });
 });
 
-// ✅ Primary routes
+// Primary routes
 app.use("/api/validity", validityRouter);
 app.use("/api/autofix", autofixRouter);
 
-// ✅ Aliases (THIS is the key fix)
-app.use("/api/report", validityRouter); // POST /api/report -> same router
-app.use("/api/fix", autofixRouter);     // POST /api/fix -> same router
+// Aliases (older naming)
+app.post("/api/report", (req, res, next) => {
+  // allow either extractedText OR instructionsText
+  if (!req.body.extractedText && req.body.instructionsText) {
+    req.body.extractedText = req.body.instructionsText;
+  }
+  return validityRouter(req, res, next); // validityRouter is a handler function export
+});
+
+app.post("/api/fix", (req, res, next) => {
+  if (!req.body.extractedText && req.body.instructionsText) {
+    req.body.extractedText = req.body.instructionsText;
+  }
+  return autofixRouter(req, res, next); // autofixRouter is a handler function export
+});
 
 // Debug helper
 app.get("/api/routes", (req, res) => {
   res.json({
     routes: [
       "GET /api/health",
+      "GET /api/routes",
       "POST /api/validity",
       "POST /api/report (alias of /api/validity)",
       "POST /api/autofix",
