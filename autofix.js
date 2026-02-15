@@ -1,114 +1,130 @@
-// autofix.js (root)
+// autofix.js (ROOT)
+// Exports a FUNCTION
+// Returns improved instructions/rubric suggestions without rewriting the whole assessment.
 
-async function groqChat({ system, user, temperature = 0.2 }) {
-  const apiKey = process.env.GROQ_API_KEY;
-  if (!apiKey) throw new Error("GROQ_API_KEY is not set.");
+function safeStr(x) {
+  return (x ?? "").toString().trim();
+}
+
+// Lite autofix: simple templates
+function liteAutofix(input) {
+  const skill = safeStr(input.skill) || "the target skill";
+  const levelFramework = safeStr(input.levelFramework) || "CLB";
+  const level = safeStr(input.level) || "5";
+  const purpose = safeStr(input.purpose) || "Summative";
+
+  const instructionsText = safeStr(input.instructionsText);
+  const rubricText = safeStr(input.rubricText);
+
+  const fixedInstructionsText =
+    instructionsText ||
+    `Task (${purpose}): Students will complete a ${skill} assessment.\n` +
+      `1) Prepare your response based on the topic.\n` +
+      `2) Submit your work (spoken or written) as instructed.\n` +
+      `3) Aim for clear organization, accurate vocabulary, and appropriate grammar for ${levelFramework} ${level}.\n` +
+      `4) Check your work before submitting.`;
+
+  const fixedRubricText =
+    rubricText ||
+    `Rubric (${levelFramework} ${level} - ${skill}):\n` +
+      `- Clarity & Organization\n` +
+      `- Vocabulary & Word Choice\n` +
+      `- Grammar & Sentence Structure\n` +
+      `- Pronunciation/Delivery (if speaking)\n` +
+      `- Task Completion\n` +
+      `Performance Levels: Needs Improvement / Developing / Competent / Strong`;
+
+  return {
+    mode: "lite",
+    fixedInstructionsText,
+    fixedRubricText,
+    notes: [
+      "Lite autofix used templates (no AI).",
+      "You can paste these into your assessment to improve clarity and measurability.",
+    ],
+  };
+}
+
+// Groq autofix
+async function groqJson(prompt, groqApiKey) {
+  if (!groqApiKey) return null;
 
   const resp = await fetch("https://api.groq.com/openai/v1/chat/completions", {
     method: "POST",
     headers: {
       "Content-Type": "application/json",
-      Authorization: `Bearer ${apiKey}`,
+      Authorization: `Bearer ${groqApiKey}`,
     },
     body: JSON.stringify({
-      model: "llama-3.1-8b-instant",
-      temperature,
+      model: "llama-3.1-70b-versatile",
+      temperature: 0.2,
       messages: [
-        { role: "system", content: system },
-        { role: "user", content: user },
+        {
+          role: "system",
+          content:
+            "You improve ESL assessment instructions/rubrics. Return STRICT JSON only with keys: fixedInstructionsText, fixedRubricText, notes.",
+        },
+        { role: "user", content: prompt },
       ],
     }),
   });
 
   if (!resp.ok) {
-    const text = await resp.text().catch(() => "");
-    throw new Error(`Groq error ${resp.status}: ${text}`);
+    const txt = await resp.text();
+    throw new Error(`Groq error ${resp.status}: ${txt}`);
   }
 
   const data = await resp.json();
-  return data?.choices?.[0]?.message?.content || "";
-}
+  const content = data?.choices?.[0]?.message?.content ?? "";
 
-function liteAutofix(input) {
-  const text = (input?.text || "").trim();
-  if (!text) {
-    return {
-      mode: "lite",
-      summary: "No text provided.",
-      improved: "",
-      changes: ["Provide `text` to autofix."],
-    };
+  const start = content.indexOf("{");
+  const end = content.lastIndexOf("}");
+  if (start === -1 || end === -1 || end <= start) {
+    throw new Error("Groq did not return JSON.");
   }
 
-  // super-light cleanup (safe + deterministic)
-  const improved = text
-    .replace(/\s+/g, " ")
-    .replace(/\s+\./g, ".")
-    .replace(/\s+,/g, ",")
-    .trim();
+  return JSON.parse(content.slice(start, end + 1));
+}
 
-  const changes = [];
-  if (improved !== text) changes.push("Normalized spacing and punctuation.");
-  else changes.push("No changes needed.");
+async function runAutofix(input, options = {}) {
+  const mode = (options.mode || "groq").toString().toLowerCase();
+  const groqApiKey = options.groqApiKey || "";
 
-  return {
-    mode: "lite",
-    summary: "Basic formatting cleanup (lite mode).",
-    improved,
-    changes,
+  if (mode === "lite") return liteAutofix(input);
+
+  const payload = {
+    skill: safeStr(input.skill),
+    levelFramework: safeStr(input.levelFramework),
+    level: safeStr(input.level),
+    purpose: safeStr(input.purpose),
+    instructionsText: safeStr(input.instructionsText),
+    rubricText: safeStr(input.rubricText),
   };
-}
 
-async function runAutofix(input, opts = {}) {
-  const requestedMode = (opts.mode || "").toLowerCase(); // "groq" | "lite" | ""
-  const forceLite = requestedMode === "lite";
-  const forceGroq = requestedMode === "groq";
-
-  if (forceLite) return liteAutofix(input);
-
-  const hasGroq = !!process.env.GROQ_API_KEY;
-
-  if (!hasGroq && forceGroq) {
-    throw new Error("mode=groq requested but GROQ_API_KEY is not set.");
-  }
-
-  if (!hasGroq) return liteAutofix(input);
-
-  const system =
-    "You are an expert ESL editor. Return ONLY valid JSON. Be concise. Make changes that improve clarity, level-appropriateness, and rubric measurability.";
-
-  const user = `
-Return JSON:
-{
-  "mode": "groq",
-  "model": "<string>",
-  "summary": "<short>",
-  "improved": "<improved version of the text>",
-  "changes": ["..."]
-}
-
-Input:
-${JSON.stringify(input, null, 2)}
-`;
+  const prompt =
+    `Improve these ESL/EAP assessment instructions + rubric.\n` +
+    `Rules:\n` +
+    `- Keep the original intent.\n` +
+    `- Make instructions clearer and measurable.\n` +
+    `- Make rubric criteria explicit.\n` +
+    `- Output STRICT JSON only.\n\n` +
+    `INPUT:\n${JSON.stringify(payload, null, 2)}`;
 
   try {
-    const raw = await groqChat({ system, user, temperature: 0.2 });
-
-    const jsonText = raw.trim().startsWith("{")
-      ? raw.trim()
-      : raw.slice(raw.indexOf("{"), raw.lastIndexOf("}") + 1);
-
-    const parsed = JSON.parse(jsonText);
+    const out = await groqJson(prompt, groqApiKey);
+    if (!out) return liteAutofix(input);
 
     return {
       mode: "groq",
-      model: "llama-3.1-8b-instant",
-      ...parsed,
+      fixedInstructionsText: safeStr(out.fixedInstructionsText) || payload.instructionsText,
+      fixedRubricText: safeStr(out.fixedRubricText) || payload.rubricText,
+      notes: Array.isArray(out.notes) ? out.notes : ["Groq autofix generated improvements."],
     };
-  } catch (err) {
-    if (forceGroq) throw err;
-    return liteAutofix(input);
+  } catch (e) {
+    const lite = liteAutofix(input);
+    lite.notes.unshift(`Groq failed; used lite autofix. (${e.message})`);
+    return lite;
   }
 }
 
-module.exports = { runAutofix };
+module.exports = runAutofix;
