@@ -2,7 +2,7 @@
   "name": "esl-validity-backend",
   "version": "1.0.0",
   "private": true,
-  "description": "ESL Assessment Validity Checker backend (report + fix)",
+  "description": "ESL Assessment Validity Checker backend (Groq + Lite fallback)",
   "main": "server.js",
   "type": "commonjs",
   "scripts": {
@@ -14,6 +14,6 @@
   "dependencies": {
     "cors": "^2.8.5",
     "express": "^4.19.2",
-    "openai": "^4.0.0"
+    "groq-sdk": "^0.8.0"
   }
 }
