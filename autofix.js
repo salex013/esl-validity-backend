@@ -1,186 +1,118 @@
-const Groq = require("groq-sdk");
+const express = require("express");
+const router = express.Router();
 
-function getRequestedMode(req) {
-  const q = String(req.query?.mode || "").toLowerCase();
-  const h = String(req.headers["x-mode"] || "").toLowerCase();
-  if (q === "lite" || h === "lite") return "lite";
-  return "auto";
-}
+const { callGroq } = require("./llm");
 
-function safeTrim(s, max = 20000) {
-  if (!s) return "";
-  const t = String(s);
-  return t.length > max ? t.slice(0, max) + "\n\n[TRUNCATED]" : t;
-}
+function liteFix({ instructionsText = "", rubricText = "" }) {
+  const improvedInstructions =
+    instructionsText.trim()
+      ? instructionsText.trim() + "\n\n(Quick fix tip: Add time limit + required elements + submission format.)"
+      : "Add: time limit, topic, steps, required elements, and submission format.";
 
-/** --------- LITE AUTOFIX (no AI) ---------- */
-function liteAutofix({ skill, levelFramework, level, purpose, instructionsText, rubricText }) {
-  const instr = (instructionsText || "").trim();
-  const rubric = (rubricText || "").trim();
-
-  // Very simple scaffolded rewrite templates
-  const improvedInstructions = instr
-    ? [
-        "TASK: " + instr.replace(/\s+/g, " ").trim(),
-        "",
-        "STUDENT-FRIENDLY STEPS:",
-        "1) Read the task carefully.",
-        "2) Plan your ideas (use keywords).",
-        "3) Complete the task (time limit if given).",
-        "4) Check: content, organization, language accuracy.",
-        "",
-        "SUCCESS TIPS:",
-        "- Use clear topic sentences.",
-        "- Use examples/details.",
-        "- Speak/write clearly and at a steady pace."
-      ].join("\n")
-    : "No instructions provided.";
-
-  const improvedRubric = rubric
-    ? [
-        "RUBRIC (Refined):",
-        "- Task Achievement: meets the instructions and purpose",
-        "- Organization: clear structure; logical order",
-        "- Language: appropriate vocabulary + grammar control",
-        "- (Speaking) Delivery: clarity, pronunciation, fluency / (Writing) Mechanics: spelling, punctuation",
-        "",
-        "ORIGINAL RUBRIC:",
-        rubric
-      ].join("\n")
-    : "No rubric provided.";
+  const improvedRubric =
+    rubricText.trim()
+      ? rubricText.trim() + "\n\n(Quick fix tip: Add 3–5 criteria + 3 levels with observable descriptors.)"
+      : "Create a rubric with 3–5 criteria (clarity, organization, vocabulary, accuracy, task completion) and 3 levels (Approaches/Meets/Exceeds).";
 
   return {
     mode: "lite",
-    summary: "Generated a scaffolded version of your instructions and a clarified rubric template.",
-    improved: {
-      instructionsText: improvedInstructions,
-      rubricText: improvedRubric
-    },
-    notes: [
-      "Lite mode uses templates and heuristics (no AI).",
-      "If Groq is enabled, you’ll get a more customized rewrite."
-    ],
-    metadata: { skill: skill || null, levelFramework: levelFramework || null, level: level || null, purpose: purpose || null }
+    improvedInstructions,
+    improvedRubric
   };
 }
 
-/** --------- GROQ AUTOFIX ---------- */
-async function groqAutofix({ skill, levelFramework, level, purpose, instructionsText, rubricText }) {
-  const apiKey = process.env.GROQ_API_KEY;
-  if (!apiKey) throw new Error("Missing GROQ_API_KEY");
-
-  const groq = new Groq({ apiKey });
-  const model = process.env.GROQ_MODEL || "llama-3.1-8b-instant";
-
+function buildFixPrompt({ instructionsText, rubricText }) {
   const system = `
-You rewrite ESL assessment materials for clarity and validity.
-Return ONLY JSON with keys:
-summary (string),
-improved (object with keys instructionsText, rubricText),
-changes (string[]),
-warnings (string[]).
-Keep it concise and aligned to the given level/purpose.
-`.trim();
+You are an expert ESL assessment editor.
+Return ONLY JSON (no markdown).
 
-  const user = `
-Rewrite these materials.
-
-Skill: ${skill || "N/A"}
-Level framework: ${levelFramework || "N/A"}
-Level: ${level || "N/A"}
-Purpose: ${purpose || "N/A"}
-
-Instructions:
-${safeTrim(instructionsText, 15000)}
-
-Rubric:
-${safeTrim(rubricText, 15000)}
-`.trim();
-
-  const resp = await groq.chat.completions.create({
-    model,
-    temperature: 0.3,
-    max_tokens: 900,
-    messages: [
-      { role: "system", content: system },
-      { role: "user", content: user }
-    ]
-  });
-
-  const text = resp.choices?.[0]?.message?.content || "";
-  let parsed;
-  try {
-    parsed = JSON.parse(text);
-  } catch (e) {
-    const start = text.indexOf("{");
-    const end = text.lastIndexOf("}");
-    if (start >= 0 && end > start) {
-      parsed = JSON.parse(text.slice(start, end + 1));
-    } else {
-      throw new Error("Groq returned non-JSON.");
-    }
-  }
-
-  return { mode: "groq", model, ...parsed };
+Schema:
+{
+  "mode":"groq",
+  "model":"string",
+  "improvedInstructions":"string",
+  "improvedRubric":"string",
+  "notes":["..."]
 }
 
-/** --------- HANDLER ---------- */
-module.exports = async function autofixHandler(req, res) {
+Rules:
+- Keep language teacher-friendly.
+- Make rubric criteria observable and level-appropriate.
+- Keep it concise.
+`;
+
+  const user = `
+Improve this assessment:
+
+Instructions:
+${instructionsText || "(none)"}
+
+Rubric:
+${rubricText || "(none)"}
+
+Make the instructions clearer + more complete.
+Make the rubric more measurable (criteria + performance descriptors).
+`;
+
+  return [
+    { role: "system", content: system.trim() },
+    { role: "user", content: user.trim() }
+  ];
+}
+
+/**
+ * POST /api/autofix
+ * Also works via alias POST /api/fix (handled in server.js)
+ *
+ * Optional query:
+ *  - ?mode=groq | lite | auto
+ */
+router.post("/", async (req, res) => {
   try {
-    const modeReq = getRequestedMode(req);
+    const { instructionsText, rubricText } = req.body || {};
+    const modeQuery = (req.query.mode || "").toLowerCase();
+    const mode = modeQuery || "auto";
 
-    const {
-      skill,
-      levelFramework,
-      level,
-      purpose,
-      instructionsText,
-      rubricText,
-      extractedText
-    } = req.body || {};
-
-    const instructions = instructionsText || extractedText || "";
-
-    if (!instructions && !rubricText) {
-      return res.status(400).json({
-        ok: false,
-        error: "Missing instructionsText (or extractedText) and rubricText."
-      });
+    if (mode === "lite") {
+      return res.json({ ok: true, fix: liteFix({ instructionsText, rubricText }) });
     }
 
-    if (modeReq === "lite") {
-      const result = liteAutofix({
-        skill, levelFramework, level, purpose,
-        instructionsText: instructions,
-        rubricText
-      });
-      return res.json({ ok: true, result });
+    const groqKey = process.env.GROQ_API_KEY;
+    if (!groqKey) {
+      return res.json({ ok: true, fix: liteFix({ instructionsText, rubricText }) });
     }
 
+    const messages = buildFixPrompt({ instructionsText, rubricText });
+    let content = await callGroq({
+      apiKey: groqKey,
+      model: process.env.GROQ_MODEL || "llama-3.1-8b-instant",
+      temperature: 0.2,
+      messages
+    });
+
+    let parsed;
     try {
-      const result = await groqAutofix({
-        skill, levelFramework, level, purpose,
-        instructionsText: instructions,
-        rubricText
-      });
-      return res.json({ ok: true, result });
-    } catch (err) {
-      const result = liteAutofix({
-        skill, levelFramework, level, purpose,
-        instructionsText: instructions,
-        rubricText
-      });
-      return res.json({
-        ok: true,
-        result,
-        fallback: {
-          from: "groq",
-          to: "lite",
-          reason: String(err?.message || err)
-        }
-      });
+      parsed = JSON.parse(content);
+    } catch {
+      const start = content.indexOf("{");
+      const end = content.lastIndexOf("}");
+      parsed = JSON.parse(content.slice(start, end + 1));
     }
-  } catch (e) {
-    return res.status(500).json({ ok: false, error: String(e?.message || e) });
+
+    parsed.mode = "groq";
+    parsed.model = parsed.model || (process.env.GROQ_MODEL || "llama-3.1-8b-instant");
+
+    return res.json({ ok: true, fix: parsed });
+  } catch (err) {
+    // fallback instead of failing
+    return res.json({
+      ok: true,
+      fix: {
+        ...liteFix(req.body || {}),
+        note: "Groq failed; returned lite fallback."
+      }
+    });
   }
-};
+});
+
+module.exports = router;
