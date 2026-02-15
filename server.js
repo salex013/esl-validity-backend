@@ -1,166 +1,310 @@
-// server.js (ROOT) — CommonJS only (NO import statements)
+// server.js (ROOT) — CommonJS entrypoint for Render: `node server.js`
+
+require("dotenv").config();
 
 const express = require("express");
 const cors = require("cors");
 
-// Your local modules (root)
-const { runValidity, liteValidity } = require("./validity");
-const { runAutofix } = require("./autofix");
+const { callGroq, liteValidity } = require("./llm");
 
-// Optional export handlers (in /src/export)
-let makePdf;
-let makeDocx;
-try {
-  makePdf = require("./src/export/pdf");
-} catch (e) {
-  makePdf = null;
-}
-try {
-  makeDocx = require("./src/export/docx");
-} catch (e) {
-  makeDocx = null;
-}
-
+// --------------------
+// App setup
+// --------------------
 const app = express();
+
 app.use(cors());
-app.use(express.json({ limit: "2mb" }));
+app.use(express.json({ limit: "1mb" }));
 
-// --- Admin auth (Render Environment Variable: ADMIN_KEY) ---
-function requireAdmin(req, res, next) {
-  const expected = process.env.ADMIN_KEY || "";
-  const provided = req.header("x-admin-key") || "";
+// --------------------
+// Simple admin auth (supports BOTH headers)
+// - x-admin-key: <key>
+// - Authorization: Bearer <key>
+// --------------------
+function getAdminKeyFromReq(req) {
+  const x = req.get("x-admin-key");
+  if (x) return x.trim();
 
+  const auth = req.get("authorization");
+  if (!auth) return "";
+  const m = auth.match(/^Bearer\s+(.+)$/i);
+  return m ? m[1].trim() : "";
+}
+
+function adminOnly(req, res, next) {
+  const expected = (process.env.ADMIN_KEY || "").trim();
   if (!expected) {
-    return res.status(500).json({ ok: false, error: "ADMIN_KEY not configured on server." });
+    return res.status(500).json({ ok: false, error: "ADMIN_KEY is not set on the server." });
   }
-  if (provided !== expected) {
+  const provided = getAdminKeyFromReq(req);
+
+  // constant-ish compare (good enough for this use case)
+  if (provided.length !== expected.length) {
+    return res.status(401).json({ ok: false, error: "Unauthorized" });
+  }
+  let mismatch = 0;
+  for (let i = 0; i < expected.length; i++) mismatch |= expected.charCodeAt(i) ^ provided.charCodeAt(i);
+  if (mismatch !== 0) {
     return res.status(401).json({ ok: false, error: "Unauthorized" });
   }
   next();
 }
 
-// --- Simple in-memory history (good enough for now) ---
-const history = []; // newest first
-function addToHistory(item) {
-  history.unshift(item);
-  if (history.length > 200) history.length = 200;
+// --------------------
+// In-memory history (safe + simple for Render free tier)
+// --------------------
+const HISTORY = [];
+const HISTORY_MAX = 200;
+
+function addHistory(entry) {
+  HISTORY.unshift(entry);
+  if (HISTORY.length > HISTORY_MAX) HISTORY.length = HISTORY_MAX;
 }
 
-// --- Health / Routes ---
+// --------------------
+// Helpers
+// --------------------
+function nowIso() {
+  return new Date().toISOString();
+}
+
+function requireFields(body, fields) {
+  const missing = [];
+  for (const f of fields) {
+    if (body[f] === undefined || body[f] === null || String(body[f]).trim() === "") missing.push(f);
+  }
+  return missing;
+}
+
+function buildGroqMessages(payload) {
+  const {
+    skill,
+    levelFramework,
+    level,
+    purpose,
+    instructionsText,
+    rubricText
+  } = payload;
+
+  return [
+    {
+      role: "system",
+      content:
+        "You are an ESL/EAP Assessment Designer and Validator. Return STRICT JSON only (no markdown)."
+    },
+    {
+      role: "user",
+      content:
+        [
+          "Validate the assessment for alignment, clarity, measurability, fairness/accessibility, and rubric quality.",
+          "Return JSON with this shape:",
+          `{`,
+          `  "summary": string,`,
+          `  "strengths": string[],`,
+          `  "issues": string[],`,
+          `  "suggestions": string[],`,
+          `  "scores": { "clarity": 1|2|3|4, "alignment": 1|2|3|4, "measurability": 1|2|3|4, "fairness_accessibility": 1|2|3|4 },`,
+          `  "overall": { "band": 1|2|3|4, "label": "Approaches"|"Meets"|"Exceeds" },`,
+          `  "riskLevel": "low"|"medium"|"high"`,
+          `}`,
+          "",
+          `Skill: ${skill}`,
+          `Framework: ${levelFramework}`,
+          `Level: ${level}`,
+          `Purpose: ${purpose}`,
+          "",
+          `Instructions: ${instructionsText}`,
+          "",
+          `Rubric: ${rubricText}`
+        ].join("\n")
+    }
+  ];
+}
+
+function safeJsonParse(maybeJsonText) {
+  // Try strict parse first
+  try {
+    return JSON.parse(maybeJsonText);
+  } catch (_) {}
+
+  // Try to extract the first {...} block (in case model added extra text)
+  const start = maybeJsonText.indexOf("{");
+  const end = maybeJsonText.lastIndexOf("}");
+  if (start >= 0 && end > start) {
+    const slice = maybeJsonText.slice(start, end + 1);
+    try {
+      return JSON.parse(slice);
+    } catch (_) {}
+  }
+
+  return null;
+}
+
+// --------------------
+// Routes
+// --------------------
 app.get("/api/health", (req, res) => {
   res.json({
     ok: true,
     name: "ESL Validity Tool Backend",
-    timestamp: new Date().toISOString(),
+    timestamp: nowIso(),
     groqConfigured: !!process.env.GROQ_API_KEY,
-    liteAvailable: true,
-    adminConfigured: !!process.env.ADMIN_KEY,
+    liteAvailable: true
   });
 });
 
 app.get("/api/routes", (req, res) => {
   res.json({
     routes: [
-      "GET /api/health",
-      "GET /api/routes",
+      "GET  /api/health",
+      "GET  /api/routes",
+      "GET  /api/status",
       "POST /api/report",
-      "POST /api/report?mode=lite",
-      "POST /api/autofix",
-      "POST /api/fix (alias of /api/autofix)",
-      "GET /api/history?limit=20 (admin)",
-      "GET /api/report/pdf/:id (admin, if pdf export exists)",
-      "GET /api/report/docx/:id (admin, if docx export exists)",
-    ],
+      "GET  /api/history?limit=20 (admin)",
+    ]
   });
 });
 
-// --- Main report endpoint ---
+app.get("/api/status", (req, res) => {
+  res.json({
+    ok: true,
+    timestamp: nowIso(),
+    env: {
+      hasAdminKey: !!process.env.ADMIN_KEY,
+      hasGroqKey: !!process.env.GROQ_API_KEY
+    },
+    defaults: {
+      model: process.env.GROQ_MODEL || "llama-3.3-70b-versatile",
+      temperature: process.env.GROQ_TEMP ? Number(process.env.GROQ_TEMP) : 0.2
+    }
+  });
+});
+
+/**
+ * POST /api/report
+ * Body:
+ * {
+ *   skill, levelFramework, level, purpose,
+ *   instructionsText, rubricText,
+ *   model?, temperature?
+ * }
+ *
+ * Query:
+ *   ?mode=lite   -> uses liteValidity()
+ *   (default)    -> uses Groq if configured; otherwise lite fallback
+ */
 app.post("/api/report", async (req, res) => {
   try {
-    const mode = (req.query.mode || "").toLowerCase();
-    const input = req.body || {};
+    const payload = req.body || {};
 
-    let report;
-    if (mode === "lite") {
-      report = liteValidity(input); // local heuristic, zero-cost
-    } else {
-      report = await runValidity(input); // Groq-backed (or your logic)
+    const missing = requireFields(payload, [
+      "skill",
+      "levelFramework",
+      "level",
+      "purpose",
+      "instructionsText",
+      "rubricText"
+    ]);
+    if (missing.length) {
+      return res.status(400).json({ ok: false, error: `Missing: ${missing.join(", ")}` });
     }
 
-    const id = `${Date.now()}-${Math.random().toString(16).slice(2)}`;
-    addToHistory({ id, createdAt: new Date().toISOString(), mode: report?.mode || mode || "groq", input, report });
+    const mode = (req.query.mode || "").toString().toLowerCase().trim();
 
-    res.json({ ok: true, id, report });
+    // Always allow explicit lite mode
+    if (mode === "lite") {
+      const report = liteValidity(payload);
+      addHistory({ id: cryptoRandomId(), ts: nowIso(), mode: "lite", input: summarizeInput(payload), report });
+      return res.json({ ok: true, report });
+    }
+
+    // If Groq not configured, fallback to lite
+    const apiKey = (process.env.GROQ_API_KEY || "").trim();
+    if (!apiKey) {
+      const report = liteValidity(payload);
+      addHistory({ id: cryptoRandomId(), ts: nowIso(), mode: "lite", input: summarizeInput(payload), report });
+      return res.json({
+        ok: true,
+        report: {
+          ...report,
+          summary: "Groq not configured on server; returned lite checks."
+        }
+      });
+    }
+
+    const model = (payload.model || process.env.GROQ_MODEL || "llama-3.3-70b-versatile").trim();
+    const temperature =
+      payload.temperature !== undefined
+        ? Number(payload.temperature)
+        : process.env.GROQ_TEMP
+          ? Number(process.env.GROQ_TEMP)
+          : 0.2;
+
+    // Use your llm.js helper to call Groq
+    const messages = buildGroqMessages(payload);
+    const content = await callGroq({ apiKey, messages, model, temperature });
+
+    const parsed = safeJsonParse(content);
+    let report;
+
+    if (parsed && typeof parsed === "object") {
+      report = {
+        mode: "groq",
+        model,
+        ...parsed
+      };
+    } else {
+      // If model output isn't parseable JSON, fallback to lite + include raw
+      const lite = liteValidity(payload);
+      report = {
+        ...lite,
+        mode: "lite",
+        summary: "Groq returned non-JSON output; returned lite checks instead.",
+        groqRaw: String(content || "").slice(0, 4000)
+      };
+    }
+
+    addHistory({ id: cryptoRandomId(), ts: nowIso(), mode: report.mode, model, input: summarizeInput(payload), report });
+    return res.json({ ok: true, report });
+
   } catch (err) {
-    res.status(500).json({ ok: false, error: err?.message || "Server error" });
+    return res.status(500).json({
+      ok: false,
+      error: err?.message || "Server error"
+    });
   }
 });
 
-// --- Autofix endpoint ---
-app.post("/api/autofix", async (req, res) => {
-  try {
-    const input = req.body || {};
-    const fixed = await runAutofix(input);
-
-    const id = `${Date.now()}-${Math.random().toString(16).slice(2)}`;
-    addToHistory({ id, createdAt: new Date().toISOString(), mode: "autofix", input, report: fixed });
-
-    res.json({ ok: true, id, report: fixed });
-  } catch (err) {
-    res.status(500).json({ ok: false, error: err?.message || "Server error" });
-  }
+app.get("/api/history", adminOnly, (req, res) => {
+  const limit = Math.max(1, Math.min(200, Number(req.query.limit || 20)));
+  res.json({ ok: true, count: Math.min(limit, HISTORY.length), items: HISTORY.slice(0, limit) });
 });
 
-// alias
-app.post("/api/fix", (req, res) => app._router.handle(req, res, () => {}));
-
-// --- Admin history ---
-app.get("/api/history", requireAdmin, (req, res) => {
-  const limit = Math.max(1, Math.min(200, parseInt(req.query.limit || "20", 10)));
-  res.json({ ok: true, items: history.slice(0, limit) });
-});
-
-// --- Admin export (optional) ---
-app.get("/api/report/pdf/:id", requireAdmin, async (req, res) => {
-  if (!makePdf) return res.status(501).json({ ok: false, error: "PDF export not installed." });
-  const item = history.find((h) => h.id === req.params.id);
-  if (!item) return res.status(404).json({ ok: false, error: "Not found" });
-
-  // Your pdf module can be either a function or { makePdf }
-  const fn = typeof makePdf === "function" ? makePdf : makePdf.makePdf;
-  if (typeof fn !== "function") return res.status(500).json({ ok: false, error: "PDF export module invalid." });
-
-  try {
-    res.setHeader("Content-Type", "application/pdf");
-    res.setHeader("Content-Disposition", `attachment; filename="report-${item.id}.pdf"`);
-    await fn({ res, item });
-  } catch (e) {
-    res.status(500).json({ ok: false, error: e?.message || "PDF export failed" });
-  }
-});
-
-app.get("/api/report/docx/:id", requireAdmin, async (req, res) => {
-  if (!makeDocx) return res.status(501).json({ ok: false, error: "DOCX export not installed." });
-  const item = history.find((h) => h.id === req.params.id);
-  if (!item) return res.status(404).json({ ok: false, error: "Not found" });
-
-  const fn = typeof makeDocx === "function" ? makeDocx : makeDocx.makeDocx;
-  if (typeof fn !== "function") return res.status(500).json({ ok: false, error: "DOCX export module invalid." });
-
-  try {
-    res.setHeader(
-      "Content-Type",
-      "application/vnd.openxmlformats-officedocument.wordprocessingml.document"
-    );
-    res.setHeader("Content-Disposition", `attachment; filename="report-${item.id}.docx"`);
-    await fn({ res, item });
-  } catch (e) {
-    res.status(500).json({ ok: false, error: e?.message || "DOCX export failed" });
-  }
-});
-
-// --- Start ---
+// --------------------
+// Start
+// --------------------
 const PORT = process.env.PORT || 10000;
+
 app.listen(PORT, () => {
   console.log(`Server running on port ${PORT}`);
 });
+
+// --------------------
+// Small utilities
+// --------------------
+function cryptoRandomId() {
+  // Node 18+ has global crypto
+  try {
+    return crypto.randomUUID();
+  } catch (_) {
+    return `${Date.now()}-${Math.random().toString(16).slice(2)}`;
+  }
+}
+
+function summarizeInput(p) {
+  return {
+    skill: p.skill,
+    levelFramework: p.levelFramework,
+    level: p.level,
+    purpose: p.purpose
+  };
+}
