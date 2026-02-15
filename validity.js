@@ -1,203 +1,146 @@
-const Groq = require("groq-sdk");
+const express = require("express");
+const router = express.Router();
 
-/**
- * Decide mode:
- * - ?mode=lite OR header x-mode=lite  => lite
- * - else try groq if GROQ_API_KEY exists
- * - if groq fails => lite fallback
- */
-function getRequestedMode(req) {
-  const q = String(req.query?.mode || "").toLowerCase();
-  const h = String(req.headers["x-mode"] || "").toLowerCase();
-  if (q === "lite" || h === "lite") return "lite";
-  return "auto";
-}
+const { callGroq, liteValidity } = require("./llm");
 
-function safeTrim(s, max = 20000) {
-  if (!s) return "";
-  const t = String(s);
-  return t.length > max ? t.slice(0, max) + "\n\n[TRUNCATED]" : t;
-}
-
-/** ---------- LITE CHECKS (no AI) ---------- */
-function liteValidityReport({ skill, levelFramework, level, purpose, instructionsText, rubricText }) {
-  const issues = [];
-  const suggestions = [];
-
-  const instr = (instructionsText || "").trim();
-  const rubric = (rubricText || "").trim();
-
-  if (!instr) issues.push("Missing instructionsText (task instructions).");
-  if (!rubric) issues.push("Missing rubricText (assessment rubric).");
-
-  if (instr.length > 0 && instr.length < 40) {
-    issues.push("Instructions are very short; may be unclear for students.");
-    suggestions.push("Add context: task goal, steps, time limit, and required language features.");
-  }
-
-  // Basic “rubric coverage” heuristic
-  const rubricSignals = ["clarity", "organization", "vocabulary", "grammar", "pronunciation", "fluency", "content", "task", "criteria"];
-  const foundSignals = rubricSignals.filter(w => rubric.toLowerCase().includes(w));
-  if (rubric && foundSignals.length < 2) {
-    issues.push("Rubric may be too vague (few clear criteria keywords detected).");
-    suggestions.push("Include 3–5 criteria (e.g., task achievement, organization, language control, pronunciation/fluency).");
-  }
-
-  // Level sanity hints
-  if (String(levelFramework).toLowerCase().includes("clb")) {
-    if (String(level) === "5" && instr.toLowerCase().includes("research") && instr.toLowerCase().includes("cite")) {
-      suggestions.push("For CLB 5, consider simplifying research/citation demands or providing a scaffold/template.");
-    }
-  }
-
-  // Purpose sanity
-  if (purpose && String(purpose).toLowerCase().includes("summative") && instr.toLowerCase().includes("practice")) {
-    suggestions.push("If this is summative, remove 'practice' language or clarify grading weight.");
-  }
-
-  // Output shape similar to AI version
-  return {
-    mode: "lite",
-    summary: issues.length ? "Some potential validity risks detected." : "No major issues detected by Lite checks.",
-    issues,
-    strengths: [
-      ...(instr ? ["Instructions provided."] : []),
-      ...(rubric ? ["Rubric provided."] : [])
-    ],
-    suggestions: suggestions.length ? suggestions : ["Looks OK. If you want deeper feedback, enable Groq mode."],
-    metadata: {
-      skill: skill || null,
-      levelFramework: levelFramework || null,
-      level: level || null,
-      purpose: purpose || null
-    }
-  };
-}
-
-/** ---------- GROQ ---------- */
-async function groqValidityReport({ skill, levelFramework, level, purpose, instructionsText, rubricText }) {
-  const apiKey = process.env.GROQ_API_KEY;
-  if (!apiKey) throw new Error("Missing GROQ_API_KEY");
-
-  const groq = new Groq({ apiKey });
-
-  const model = process.env.GROQ_MODEL || "llama-3.1-8b-instant";
-
+function buildValidityPrompt({ skill, levelFramework, level, purpose, instructionsText, rubricText }) {
   const system = `
-You are an ESL assessment quality checker.
-Return ONLY valid JSON (no markdown) with keys:
-summary (string),
-strengths (string[]),
-issues (string[]),
-suggestions (string[]),
-alignment (object with keys: skillMatch, levelMatch, purposeMatch as strings),
-riskLevel (one of: "low","medium","high").
-Be concise and practical.
-`.trim();
+You are an expert ESL/EAP assessment designer.
+Return ONLY valid JSON. No markdown. No extra commentary.
+
+You must evaluate assessment validity + alignment for adult ESL learners.
+Use concise, teacher-friendly language.
+
+Output JSON schema:
+{
+  "mode": "groq",
+  "model": "string",
+  "summary": "string",
+  "strengths": ["..."],
+  "issues": ["..."],
+  "suggestions": ["..."],
+  "scores": {
+    "clarity": 1-4,
+    "alignment": 1-4,
+    "measurability": 1-4,
+    "fairness_accessibility": 1-4
+  },
+  "overall": { "band": 1-4, "label": "Approaches|Meets|Exceeds" },
+  "riskLevel": "low|medium|high"
+}
+
+Scoring guide (1-4):
+1 = major problems, 2 = some problems, 3 = solid, 4 = excellent.
+Overall label:
+1-2 Approaches, 3 Meets, 4 Exceeds.
+`;
 
   const user = `
-Analyze this assessment.
+Analyze this ESL assessment:
 
-Skill: ${skill || "N/A"}
-Level framework: ${levelFramework || "N/A"}
-Level: ${level || "N/A"}
-Purpose: ${purpose || "N/A"}
+Skill: ${skill || "(missing)"}
+Level framework: ${levelFramework || "(missing)"}
+Level: ${level || "(missing)"}
+Purpose: ${purpose || "(missing)"}
 
 Instructions:
-${safeTrim(instructionsText, 15000)}
+${instructionsText || "(none)"}
 
 Rubric:
-${safeTrim(rubricText, 15000)}
-`.trim();
+${rubricText || "(none)"}
 
-  const resp = await groq.chat.completions.create({
-    model,
-    temperature: 0.2,
-    max_tokens: 900,
-    messages: [
-      { role: "system", content: system },
-      { role: "user", content: user }
-    ]
-  });
+Focus areas:
+- Are instructions clear and complete?
+- Does rubric match the task and level?
+- Are criteria observable/measurable?
+- Any fairness/accessibility issues (time, bias, language load)?
+- Provide actionable improvements.
+`;
 
-  const text = resp.choices?.[0]?.message?.content || "";
-  // Best-effort JSON parse
-  let parsed;
-  try {
-    parsed = JSON.parse(text);
-  } catch (e) {
-    // Try to salvage JSON if model added extra text
-    const start = text.indexOf("{");
-    const end = text.lastIndexOf("}");
-    if (start >= 0 && end > start) {
-      parsed = JSON.parse(text.slice(start, end + 1));
-    } else {
-      throw new Error("Groq returned non-JSON.");
-    }
-  }
-
-  return { mode: "groq", model, ...parsed };
+  return [
+    { role: "system", content: system.trim() },
+    { role: "user", content: user.trim() }
+  ];
 }
 
-/** ---------- HANDLER ---------- */
-module.exports = async function validityHandler(req, res) {
+/**
+ * POST /api/validity
+ * Also works via alias POST /api/report (handled in server.js)
+ *
+ * Optional query:
+ *  - ?mode=groq | lite | auto
+ */
+router.post("/", async (req, res) => {
   try {
-    const modeReq = getRequestedMode(req);
-
     const {
       skill,
       levelFramework,
       level,
       purpose,
       instructionsText,
-      rubricText,
-      extractedText // allow legacy field
+      rubricText
     } = req.body || {};
 
-    const instructions = instructionsText || extractedText || "";
+    const modeQuery = (req.query.mode || "").toLowerCase();
+    const mode = modeQuery || "auto";
 
-    // Minimal validation
-    if (!instructions && !rubricText) {
-      return res.status(400).json({
-        ok: false,
-        error: "Missing instructionsText (or extractedText) and rubricText."
-      });
+    // Always allow forced lite mode
+    if (mode === "lite") {
+      return res.json({ ok: true, report: liteValidity({ skill, levelFramework, level, purpose, instructionsText, rubricText }) });
     }
 
-    if (modeReq === "lite") {
-      const report = liteValidityReport({
-        skill, levelFramework, level, purpose,
-        instructionsText: instructions,
-        rubricText
-      });
-      return res.json({ ok: true, report });
+    const groqKey = process.env.GROQ_API_KEY;
+
+    // If no Groq key or mode=auto and key missing -> lite
+    if (!groqKey) {
+      return res.json({ ok: true, report: liteValidity({ skill, levelFramework, level, purpose, instructionsText, rubricText }) });
     }
 
-    // auto: try groq, fallback to lite
+    const messages = buildValidityPrompt({ skill, levelFramework, level, purpose, instructionsText, rubricText });
+
+    let content = await callGroq({
+      apiKey: groqKey,
+      model: process.env.GROQ_MODEL || "llama-3.1-8b-instant",
+      temperature: 0.2,
+      messages
+    });
+
+    // Parse JSON safely (Groq should return JSON, but just in case)
+    let parsed;
     try {
-      const report = await groqValidityReport({
-        skill, levelFramework, level, purpose,
-        instructionsText: instructions,
-        rubricText
-      });
-      return res.json({ ok: true, report });
-    } catch (err) {
-      const report = liteValidityReport({
-        skill, levelFramework, level, purpose,
-        instructionsText: instructions,
-        rubricText
-      });
+      parsed = JSON.parse(content);
+    } catch {
+      // If it returns stray text, do a simple cleanup attempt:
+      const start = content.indexOf("{");
+      const end = content.lastIndexOf("}");
+      if (start >= 0 && end > start) {
+        parsed = JSON.parse(content.slice(start, end + 1));
+      } else {
+        throw new Error("Model did not return valid JSON.");
+      }
+    }
+
+    // Ensure required fields + fill defaults
+    parsed.mode = "groq";
+    parsed.model = parsed.model || (process.env.GROQ_MODEL || "llama-3.1-8b-instant");
+
+    return res.json({ ok: true, report: parsed });
+  } catch (err) {
+    // Graceful fallback to lite if Groq fails/quota/etc.
+    const status = err.status || 500;
+    const msg = String(err.message || "Unknown error");
+    if (status === 429 || msg.includes("quota") || msg.includes("rate") || msg.includes("insufficient")) {
       return res.json({
         ok: true,
-        report,
-        fallback: {
-          from: "groq",
-          to: "lite",
-          reason: String(err?.message || err)
+        report: {
+          ...liteValidity(req.body || {}),
+          note: "Groq failed (quota/rate). Returned lite fallback instead."
         }
       });
     }
-  } catch (e) {
-    return res.status(500).json({ ok: false, error: String(e?.message || e) });
+
+    return res.status(500).json({ ok: false, error: msg });
   }
-};
+});
+
+module.exports = router;
