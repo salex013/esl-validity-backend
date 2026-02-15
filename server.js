@@ -1,28 +1,20 @@
+// server.js (FULL FIXED - no validity-lite required)
+
 const express = require("express");
 const cors = require("cors");
 
-const validityRouter = require("./validity");
-const autofixRouter = require("./autofix");
+const validityRouter = require("./validity"); // POST /api/validity
+const autofixRouter = require("./autofix");   // POST /api/autofix
 
 const app = express();
 
 app.use(cors());
 app.use(express.json({ limit: "5mb" }));
 
-// ==============================
-// 🔐 ADMIN KEY (hardcoded)
-// ==============================
-const ADMIN_KEY = "sara-validity-2026-super-secret";
-
-// ==============================
-// In-memory report store
-// ==============================
-const reports = [];
-
-// ==============================
-// Health
-// ==============================
+// Root + health checks
 app.get("/", (req, res) => res.send("OK"));
+
+app.get("/health", (req, res) => res.json({ ok: true }));
 
 app.get("/api/health", (req, res) => {
   res.json({
@@ -32,92 +24,43 @@ app.get("/api/health", (req, res) => {
   });
 });
 
-// ==============================
-// MAIN REPORT ROUTE
-// ==============================
-app.post("/api/report", async (req, res) => {
-  try {
-    const mode = req.query.mode || "groq";
+// Primary routes
+app.use("/api/validity", validityRouter);
+app.use("/api/autofix", autofixRouter);
 
-    // Run AI validation
-    const report = await validityRouter.runValidation(req.body, mode);
-
-    const id = `rep_${Date.now()}`;
-
-    const stored = {
-      id,
-      createdAt: new Date().toISOString(),
-      input: req.body,
-      report,
-    };
-
-    reports.unshift(stored);
-
-    res.json({
-      ok: true,
-      id,
-      report,
-    });
-  } catch (err) {
-    console.error("REPORT ERROR:", err);
-    res.status(500).json({ ok: false, error: err.message });
+// ✅ Aliases for your frontend / older naming
+// /api/report -> same handler as /api/validity
+// /api/fix    -> same handler as /api/autofix
+app.post("/api/report", (req, res, next) => {
+  // allow either extractedText OR instructionsText
+  if (!req.body.extractedText && req.body.instructionsText) {
+    req.body.extractedText = req.body.instructionsText;
   }
+  return validityRouter.handle(req, res, next);
 });
 
-// ==============================
-// Autofix route
-// ==============================
-app.post("/api/fix", async (req, res) => {
-  try {
-    const mode = req.query.mode || "groq";
-
-    const result = await autofixRouter.runAutofix(req.body, mode);
-
-    res.json({
-      ok: true,
-      result,
-    });
-  } catch (err) {
-    console.error("AUTOFIX ERROR:", err);
-    res.status(500).json({ ok: false, error: err.message });
+app.post("/api/fix", (req, res, next) => {
+  if (!req.body.extractedText && req.body.instructionsText) {
+    req.body.extractedText = req.body.instructionsText;
   }
+  return autofixRouter.handle(req, res, next);
 });
 
-// ==============================
-// 🔐 ADMIN ROUTES
-// ==============================
-
-function checkAdmin(req, res, next) {
-  const key = req.headers["x-admin-key"];
-  if (!key || key !== ADMIN_KEY) {
-    return res.status(401).json({ ok: false, error: "Unauthorized" });
-  }
-  next();
-}
-
-// View history
-app.get("/api/history", checkAdmin, (req, res) => {
-  const limit = parseInt(req.query.limit || "20");
+// Debug helper: see what routes exist
+app.get("/api/routes", (req, res) => {
   res.json({
-    ok: true,
-    count: reports.length,
-    items: reports.slice(0, limit),
+    routes: [
+      "GET /",
+      "GET /health",
+      "GET /api/health",
+      "GET /api/routes",
+      "POST /api/validity",
+      "POST /api/report (alias of /api/validity)",
+      "POST /api/autofix",
+      "POST /api/fix (alias of /api/autofix)",
+    ],
   });
 });
 
-// Export PDF (placeholder for now)
-app.get("/api/report/pdf/:id", checkAdmin, (req, res) => {
-  res.json({ ok: true, message: "PDF export coming next" });
-});
-
-// Export DOCX (placeholder)
-app.get("/api/report/docx/:id", checkAdmin, (req, res) => {
-  res.json({ ok: true, message: "DOCX export coming next" });
-});
-
-// ==============================
-
 const PORT = process.env.PORT || 10000;
-app.listen(PORT, () => {
-  console.log("Server running on port", PORT);
-});
+app.listen(PORT, () => console.log("Server running on port", PORT));
