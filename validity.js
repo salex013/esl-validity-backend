@@ -1,145 +1,104 @@
 const express = require("express");
 const router = express.Router();
 
-const { callGroq, liteValidity } = require("./llm");
-
-function buildValidityPrompt({ skill, levelFramework, level, purpose, instructionsText, rubricText }) {
-  const system = `
-You are an expert ESL/EAP assessment designer.
-Return ONLY valid JSON. No markdown. No extra commentary.
-
-You must evaluate assessment validity + alignment for adult ESL learners.
-Use concise, teacher-friendly language.
-
-Output JSON schema:
-{
-  "mode": "groq",
-  "model": "string",
-  "summary": "string",
-  "strengths": ["..."],
-  "issues": ["..."],
-  "suggestions": ["..."],
-  "scores": {
-    "clarity": 1-4,
-    "alignment": 1-4,
-    "measurability": 1-4,
-    "fairness_accessibility": 1-4
-  },
-  "overall": { "band": 1-4, "label": "Approaches|Meets|Exceeds" },
-  "riskLevel": "low|medium|high"
+// -----------------------------
+// Lite fallback (free, instant)
+// -----------------------------
+function liteCheck(data) {
+  return {
+    mode: "lite",
+    summary: "Basic structural validity check completed.",
+    strengths: [
+      data.instructionsText ? "Instructions provided." : null,
+      data.rubricText ? "Rubric provided." : null
+    ].filter(Boolean),
+    issues: [
+      !data.instructionsText ? "Missing instructions." : null,
+      !data.rubricText ? "Missing rubric." : null
+    ].filter(Boolean),
+    suggestions: [
+      "Ensure task aligns with CLB level.",
+      "Include explicit performance criteria.",
+      "Consider fairness and accessibility."
+    ]
+  };
 }
 
-Scoring guide (1-4):
-1 = major problems, 2 = some problems, 3 = solid, 4 = excellent.
-Overall label:
-1-2 Approaches, 3 Meets, 4 Exceeds.
-`;
-
-  const user = `
-Analyze this ESL assessment:
-
-Skill: ${skill || "(missing)"}
-Level framework: ${levelFramework || "(missing)"}
-Level: ${level || "(missing)"}
-Purpose: ${purpose || "(missing)"}
+// -----------------------------
+// Groq version
+// -----------------------------
+async function groqCheck(data) {
+  const response = await fetch("https://api.groq.com/openai/v1/chat/completions", {
+    method: "POST",
+    headers: {
+      "Authorization": `Bearer ${process.env.GROQ_API_KEY}`,
+      "Content-Type": "application/json"
+    },
+    body: JSON.stringify({
+      model: "llama-3.1-8b-instant",
+      messages: [
+        {
+          role: "system",
+          content: "You are an ESL assessment validity expert."
+        },
+        {
+          role: "user",
+          content: `
+Skill: ${data.skill}
+Framework: ${data.levelFramework}
+Level: ${data.level}
+Purpose: ${data.purpose}
 
 Instructions:
-${instructionsText || "(none)"}
+${data.instructionsText}
 
 Rubric:
-${rubricText || "(none)"}
+${data.rubricText}
 
-Focus areas:
-- Are instructions clear and complete?
-- Does rubric match the task and level?
-- Are criteria observable/measurable?
-- Any fairness/accessibility issues (time, bias, language load)?
-- Provide actionable improvements.
-`;
+Evaluate validity, alignment, clarity, and fairness.
+Respond in JSON with: summary, strengths, issues, suggestions.
+`
+        }
+      ],
+      temperature: 0.3
+    })
+  });
 
-  return [
-    { role: "system", content: system.trim() },
-    { role: "user", content: user.trim() }
-  ];
+  const json = await response.json();
+  const content = json.choices?.[0]?.message?.content || "{}";
+
+  try {
+    const parsed = JSON.parse(content);
+    return { mode: "groq", ...parsed };
+  } catch {
+    return {
+      mode: "groq",
+      summary: content
+    };
+  }
 }
 
-/**
- * POST /api/validity
- * Also works via alias POST /api/report (handled in server.js)
- *
- * Optional query:
- *  - ?mode=groq | lite | auto
- */
+// -----------------------------
+// Route
+// -----------------------------
 router.post("/", async (req, res) => {
   try {
-    const {
-      skill,
-      levelFramework,
-      level,
-      purpose,
-      instructionsText,
-      rubricText
-    } = req.body || {};
+    const data = req.body;
 
-    const modeQuery = (req.query.mode || "").toLowerCase();
-    const mode = modeQuery || "auto";
-
-    // Always allow forced lite mode
-    if (mode === "lite") {
-      return res.json({ ok: true, report: liteValidity({ skill, levelFramework, level, purpose, instructionsText, rubricText }) });
+    if (process.env.GROQ_API_KEY) {
+      const result = await groqCheck(data);
+      return res.json({ ok: true, report: result });
     }
 
-    const groqKey = process.env.GROQ_API_KEY;
+    const lite = liteCheck(data);
+    res.json({ ok: true, report: lite });
 
-    // If no Groq key or mode=auto and key missing -> lite
-    if (!groqKey) {
-      return res.json({ ok: true, report: liteValidity({ skill, levelFramework, level, purpose, instructionsText, rubricText }) });
-    }
-
-    const messages = buildValidityPrompt({ skill, levelFramework, level, purpose, instructionsText, rubricText });
-
-    let content = await callGroq({
-      apiKey: groqKey,
-      model: process.env.GROQ_MODEL || "llama-3.1-8b-instant",
-      temperature: 0.2,
-      messages
-    });
-
-    // Parse JSON safely (Groq should return JSON, but just in case)
-    let parsed;
-    try {
-      parsed = JSON.parse(content);
-    } catch {
-      // If it returns stray text, do a simple cleanup attempt:
-      const start = content.indexOf("{");
-      const end = content.lastIndexOf("}");
-      if (start >= 0 && end > start) {
-        parsed = JSON.parse(content.slice(start, end + 1));
-      } else {
-        throw new Error("Model did not return valid JSON.");
-      }
-    }
-
-    // Ensure required fields + fill defaults
-    parsed.mode = "groq";
-    parsed.model = parsed.model || (process.env.GROQ_MODEL || "llama-3.1-8b-instant");
-
-    return res.json({ ok: true, report: parsed });
   } catch (err) {
-    // Graceful fallback to lite if Groq fails/quota/etc.
-    const status = err.status || 500;
-    const msg = String(err.message || "Unknown error");
-    if (status === 429 || msg.includes("quota") || msg.includes("rate") || msg.includes("insufficient")) {
-      return res.json({
-        ok: true,
-        report: {
-          ...liteValidity(req.body || {}),
-          note: "Groq failed (quota/rate). Returned lite fallback instead."
-        }
-      });
-    }
-
-    return res.status(500).json({ ok: false, error: msg });
+    console.error(err);
+    res.status(500).json({
+      ok: false,
+      error: "Validity check failed."
+    });
   }
 });
 
