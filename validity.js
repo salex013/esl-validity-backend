@@ -1,184 +1,149 @@
-// src/validity.js
-'use strict';
+// validity.js (root)
+// Groq uses an OpenAI-compatible endpoint:
+// POST https://api.groq.com/openai/v1/chat/completions
+// Header: Authorization: Bearer <GROQ_API_KEY>
 
-// Uses Groq OpenAI-compatible API when mode="groq"
-const GROQ_API_KEY = process.env.GROQ_API_KEY || '';
-const GROQ_BASE_URL = process.env.GROQ_BASE_URL || 'https://api.groq.com/openai/v1';
-const GROQ_MODEL = process.env.GROQ_MODEL || 'llama-3.1-8b-instant';
+async function groqChat({ system, user, temperature = 0.2 }) {
+  const apiKey = process.env.GROQ_API_KEY;
+  if (!apiKey) throw new Error("GROQ_API_KEY is not set.");
 
-function requiredFieldsReport(input) {
-  const missing = [];
-  const need = ['skill', 'levelFramework', 'level', 'purpose', 'instructionsText', 'rubricText'];
-  for (const k of need) {
-    if (!input?.[k] || String(input[k]).trim().length === 0) missing.push(k);
-  }
-  return missing;
-}
-
-function liteReport(input) {
-  const missing = requiredFieldsReport(input);
-
-  const issues = [];
-  if (missing.length) {
-    issues.push(`Missing required fields: ${missing.join(', ')}`);
-  }
-
-  // Very lightweight heuristics
-  if (input?.instructionsText && String(input.instructionsText).length < 40) {
-    issues.push('Instructions are very short; may be unclear for students.');
-  }
-  if (input?.rubricText && String(input.rubricText).length < 30) {
-    issues.push('Rubric text is very short; may not be measurable.');
-  }
-
-  const strengths = [];
-  if (input?.instructionsText) strengths.push('Instructions provided.');
-  if (input?.rubricText) strengths.push('Rubric provided.');
-
-  const suggestions = [];
-  if (!/time|minute/i.test(input?.instructionsText || '')) {
-    suggestions.push('Consider adding a time limit (e.g., 3 minutes) to make expectations clearer.');
-  }
-  if (!/criteria|clarity|organization|vocabulary|pronunciation/i.test(input?.rubricText || '')) {
-    suggestions.push('Consider listing 3–5 clear criteria (e.g., clarity, organization, vocabulary, pronunciation).');
-  }
-
-  return {
-    mode: 'lite',
-    summary: missing.length
-      ? 'Basic check found missing fields and/or short text.'
-      : 'No major issues detected by lite checks.',
-    strengths,
-    issues,
-    suggestions,
-    scores: {
-      clarity: missing.length ? 0 : 2,
-      alignment: missing.length ? 0 : 2,
-      measurability: missing.length ? 0 : 1,
-      fairness_accessibility: 1,
-      overall: missing.length ? 0 : 2,
-    },
-    riskLevel: missing.length ? 'high' : issues.length ? 'medium' : 'low',
-    metadata: {
-      skill: input?.skill,
-      levelFramework: input?.levelFramework,
-      level: input?.level,
-      purpose: input?.purpose,
-    },
-  };
-}
-
-async function groqChatJSON(systemPrompt, userPrompt) {
-  if (!GROQ_API_KEY) {
-    throw new Error('GROQ_API_KEY is not set on the server.');
-  }
-
-  const resp = await fetch(`${GROQ_BASE_URL}/chat/completions`, {
-    method: 'POST',
+  const resp = await fetch("https://api.groq.com/openai/v1/chat/completions", {
+    method: "POST",
     headers: {
-      Authorization: `Bearer ${GROQ_API_KEY}`,
-      'Content-Type': 'application/json',
+      "Content-Type": "application/json",
+      Authorization: `Bearer ${apiKey}`,
     },
     body: JSON.stringify({
-      model: GROQ_MODEL,
-      temperature: 0.2,
+      model: "llama-3.1-8b-instant",
+      temperature,
       messages: [
-        { role: 'system', content: systemPrompt },
-        { role: 'user', content: userPrompt },
+        { role: "system", content: system },
+        { role: "user", content: user },
       ],
     }),
   });
 
   if (!resp.ok) {
-    const txt = await resp.text().catch(() => '');
-    throw new Error(`Groq error ${resp.status}: ${txt || resp.statusText}`);
+    const text = await resp.text().catch(() => "");
+    throw new Error(`Groq error ${resp.status}: ${text}`);
   }
 
   const data = await resp.json();
-  const content = data?.choices?.[0]?.message?.content || '';
-
-  // Extract JSON safely (handles extra text around it)
-  const firstBrace = content.indexOf('{');
-  const lastBrace = content.lastIndexOf('}');
-  if (firstBrace === -1 || lastBrace === -1 || lastBrace <= firstBrace) {
-    throw new Error('Model did not return JSON.');
-  }
-
-  const jsonStr = content.slice(firstBrace, lastBrace + 1);
-  return JSON.parse(jsonStr);
+  const content = data?.choices?.[0]?.message?.content || "";
+  return content;
 }
 
-async function groqReport(input) {
-  const systemPrompt =
-    `You are an expert ESL/EAP assessment designer and evaluator. ` +
-    `Return ONLY valid JSON (no markdown).`;
+// Very simple “lite” checker (free, deterministic)
+function liteValidity(input) {
+  const issues = [];
+  const strengths = [];
 
-  const userPrompt = `
-Evaluate the following assessment for validity and quality.
-Return JSON with:
-{
-  "summary": string,
-  "strengths": [string],
-  "issues": [string],
-  "suggestions": [string],
-  "scores": {
-    "clarity": 0-3,
-    "alignment": 0-3,
-    "measurability": 0-3,
-    "fairness_accessibility": 0-3,
-    "overall": 0-3
-  },
-  "riskLevel": "low"|"medium"|"high",
-  "metadata": {
-    "skill": string,
-    "levelFramework": string,
-    "level": string,
-    "purpose": string
+  const skill = (input?.skill || "").trim();
+  const levelFramework = (input?.levelFramework || "").trim();
+  const level = String(input?.level || "").trim();
+  const purpose = (input?.purpose || "").trim();
+  const instructionsText = (input?.instructionsText || "").trim();
+  const rubricText = (input?.rubricText || "").trim();
+
+  if (skill) strengths.push("Skill is specified.");
+  else issues.push("Missing skill (e.g., Speaking/Writing/Reading/Listening).");
+
+  if (levelFramework) strengths.push("Level framework is specified.");
+  else issues.push("Missing levelFramework (e.g., CLB/CEFR).");
+
+  if (level) strengths.push("Level is specified.");
+  else issues.push("Missing level.");
+
+  if (purpose) strengths.push("Purpose is specified.");
+  else issues.push("Missing purpose (Formative/Summative/etc.).");
+
+  if (instructionsText.length >= 20) strengths.push("Instructions are provided.");
+  else issues.push("Instructions are missing or too short.");
+
+  if (rubricText.length >= 20) strengths.push("Rubric is provided.");
+  else issues.push("Rubric is missing or too short.");
+
+  const suggestions = [];
+  if (!rubricText) suggestions.push("Add a rubric with clear criteria + performance descriptors.");
+  if (!instructionsText) suggestions.push("Add step-by-step student instructions (time, task, deliverable).");
+  if (instructionsText && !/time|minute|minutes/i.test(instructionsText)) {
+    suggestions.push("Consider adding time expectations (e.g., 3 minutes, 150–200 words, etc.).");
   }
-}
 
-Assessment input:
-skill: ${String(input?.skill || '')}
-levelFramework: ${String(input?.levelFramework || '')}
-level: ${String(input?.level || '')}
-purpose: ${String(input?.purpose || '')}
-
-instructionsText:
-${String(input?.instructionsText || '')}
-
-rubricText:
-${String(input?.rubricText || '')}
-`.trim();
-
-  const out = await groqChatJSON(systemPrompt, userPrompt);
-
-  // Minimal normalization / safety
-  out.metadata = out.metadata || {
-    skill: input?.skill,
-    levelFramework: input?.levelFramework,
-    level: input?.level,
-    purpose: input?.purpose,
+  return {
+    mode: "lite",
+    summary: issues.length ? "Some issues detected by lite checks." : "No major issues detected by lite checks.",
+    strengths,
+    issues,
+    suggestions,
+    riskLevel: issues.length >= 3 ? "high" : issues.length ? "medium" : "low",
+    metadata: {
+      skill,
+      levelFramework,
+      level,
+      purpose,
+    },
   };
-  out.scores = out.scores || {};
-  out.mode = 'groq';
-
-  return out;
 }
 
-async function runReport(input, opts = {}) {
-  const mode = (opts.mode || 'groq').toLowerCase() === 'lite' ? 'lite' : 'groq';
+async function runValidity(input, opts = {}) {
+  const requestedMode = (opts.mode || "").toLowerCase(); // "groq" | "lite" | ""
+  const forceLite = requestedMode === "lite";
+  const forceGroq = requestedMode === "groq";
 
-  if (mode === 'lite') return liteReport(input);
+  // If forced lite, do it.
+  if (forceLite) return liteValidity(input);
 
-  // Groq mode with fallback to lite if something goes wrong
+  // Try Groq unless missing key or Groq fails (unless forceGroq)
+  const hasGroq = !!process.env.GROQ_API_KEY;
+
+  if (!hasGroq && forceGroq) {
+    throw new Error("mode=groq requested but GROQ_API_KEY is not set.");
+  }
+
+  if (!hasGroq) return liteValidity(input);
+
+  const system =
+    "You are an expert ESL/EAP assessment designer. Return ONLY valid JSON matching the schema the user requests.";
+
+  const user = `
+Analyze this assessment for validity/alignment and return JSON with:
+{
+  "mode": "groq",
+  "model": "<string>",
+  "summary": "<short paragraph>",
+  "strengths": ["..."],
+  "issues": ["..."],
+  "suggestions": ["..."],
+  "scores": { "clarity": 0-2, "alignment": 0-2, "measurability": 0-2, "fairness_accessibility": 0-2, "overall": 0-8 },
+  "riskLevel": "low"|"medium"|"high"
+}
+
+Input:
+${JSON.stringify(input, null, 2)}
+`;
+
   try {
-    return await groqReport(input);
-  } catch (e) {
-    const fallback = liteReport(input);
-    fallback.mode = 'lite';
-    fallback.summary = `Groq failed; returned lite fallback. (${e?.message || 'unknown error'})`;
-    return fallback;
+    const raw = await groqChat({ system, user, temperature: 0.2 });
+
+    // Try to extract JSON even if model wraps it.
+    const jsonText = raw.trim().startsWith("{")
+      ? raw.trim()
+      : raw.slice(raw.indexOf("{"), raw.lastIndexOf("}") + 1);
+
+    const parsed = JSON.parse(jsonText);
+
+    // Ensure required fields exist
+    return {
+      mode: "groq",
+      model: "llama-3.1-8b-instant",
+      ...parsed,
+    };
+  } catch (err) {
+    if (forceGroq) throw err;
+    // fallback
+    return liteValidity(input);
   }
 }
 
-module.exports = { runReport };
+module.exports = { runValidity };
