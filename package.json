@@ -1,8 +1,8 @@
 {
   "name": "esl-validity-backend",
-  "version": "1.1.0",
+  "version": "1.0.0",
   "private": true,
-  "description": "ESL Assessment Validity Checker backend (Groq primary + Lite fallback)",
+  "description": "ESL Assessment Validity Checker backend (Groq + lite fallback)",
   "main": "server.js",
   "type": "commonjs",
   "scripts": {
@@ -13,7 +13,6 @@
   },
   "dependencies": {
     "cors": "^2.8.5",
-    "express": "^4.19.2",
-    "express-rate-limit": "^7.4.0"
+    "express": "^4.19.2"
   }
 }
