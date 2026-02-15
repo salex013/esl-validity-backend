@@ -1,18 +1,39 @@
 const express = require("express");
 const cors = require("cors");
 
-const runValidity = require("./validity");
-const runAutofix = require("./autofix");
+// Support BOTH export styles:
+// 1) module.exports = router
+// 2) module.exports = { router, ... }
+const validityMod = require("./validity");
+const autofixMod = require("./autofix");
+
+const validityRouter = validityMod?.router || validityMod;
+const autofixRouter = autofixMod?.router || autofixMod;
 
 const app = express();
 
 app.use(cors());
 app.use(express.json({ limit: "5mb" }));
 
-// Root
-app.get("/", (req, res) => res.send("OK"));
+/**
+ * If your frontend sends "instructionsText" but your route expects "extractedText",
+ * this middleware normalizes it.
+ */
+function normalizeBody(req, res, next) {
+  try {
+    if (!req.body) req.body = {};
+    if (!req.body.extractedText && req.body.instructionsText) {
+      req.body.extractedText = req.body.instructionsText;
+    }
+  } catch (e) {
+    // ignore and continue
+  }
+  next();
+}
 
-// Health
+// Health (Render check + human check)
+app.get("/", (req, res) => res.send("OK"));
+app.get("/health", (req, res) => res.json({ ok: true }));
 app.get("/api/health", (req, res) => {
   res.json({
     ok: true,
@@ -21,60 +42,25 @@ app.get("/api/health", (req, res) => {
   });
 });
 
-// 🔹 VALIDITY
-app.post("/api/validity", async (req, res) => {
-  try {
-    const result = await runValidity(req.body);
-    res.json({ ok: true, report: result });
-  } catch (err) {
-    console.error("VALIDITY ERROR:", err);
-    res.status(500).json({ ok: false, error: err.message });
-  }
-});
+// Primary routes
+app.use("/api/validity", normalizeBody, validityRouter);
+app.use("/api/autofix", normalizeBody, autofixRouter);
 
-// Alias
-app.post("/api/report", async (req, res) => {
-  try {
-    const result = await runValidity(req.body);
-    res.json({ ok: true, report: result });
-  } catch (err) {
-    console.error("REPORT ERROR:", err);
-    res.status(500).json({ ok: false, error: err.message });
-  }
-});
+// ✅ Aliases (do NOT call .handle — just mount the routers)
+app.use("/api/report", normalizeBody, validityRouter);
+app.use("/api/fix", normalizeBody, autofixRouter);
 
-// 🔹 AUTOFIX
-app.post("/api/autofix", async (req, res) => {
-  try {
-    const result = await runAutofix(req.body);
-    res.json({ ok: true, fix: result });
-  } catch (err) {
-    console.error("AUTOFIX ERROR:", err);
-    res.status(500).json({ ok: false, error: err.message });
-  }
-});
-
-// Alias
-app.post("/api/fix", async (req, res) => {
-  try {
-    const result = await runAutofix(req.body);
-    res.json({ ok: true, fix: result });
-  } catch (err) {
-    console.error("FIX ERROR:", err);
-    res.status(500).json({ ok: false, error: err.message });
-  }
-});
-
-// Debug
+// Debug helper: see what routes exist
 app.get("/api/routes", (req, res) => {
   res.json({
     routes: [
       "GET /api/health",
+      "GET /api/routes",
       "POST /api/validity",
-      "POST /api/report",
+      "POST /api/report (alias of /api/validity)",
       "POST /api/autofix",
-      "POST /api/fix"
-    ]
+      "POST /api/fix (alias of /api/autofix)",
+    ],
   });
 });
 
