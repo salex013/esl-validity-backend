@@ -1,20 +1,51 @@
-const express = require("express");
-const router = express.Router();
+// autofix.js
+// Provides a single entrypoint: runAutofix(body, mode)
+// - mode="groq" (default): uses Groq; falls back to lite if Groq fails
+// - mode="lite": uses lite only
 
-router.post("/", async (req, res) => {
-  const { instructionsText } = req.body || {};
-  if (!instructionsText) {
-    return res.status(400).json({ ok: false, error: "Missing instructionsText" });
+function normalizeInput(body = {}) {
+  const instructionsText = body.instructionsText || body.extractedText || "";
+  const rubricText = body.rubricText || "";
+
+  return {
+    skill: body.skill || "",
+    levelFramework: body.levelFramework || "CLB",
+    level: body.level || "",
+    purpose: body.purpose || "",
+    instructionsText,
+    rubricText,
+  };
+}
+
+async function runAutofix(rawBody, mode = "groq") {
+  const body = normalizeInput(rawBody);
+
+  const liteAutofix = require("./autofix-lite");
+  const groqAutofix = require("./autofix-groq");
+
+  if (mode === "lite") {
+    const result = await liteAutofix(body);
+    return {
+      mode: "lite",
+      ...result,
+    };
   }
 
-  const improved =
-    instructionsText +
-    "\n\nImprovements:\n" +
-    "- Add clear task steps.\n" +
-    "- Add time limits and submission method.\n" +
-    "- Clarify scoring criteria.\n";
+  try {
+    const result = await groqAutofix(body);
+    return {
+      mode: "groq",
+      ...result,
+    };
+  } catch (err) {
+    console.error("Groq autofix failed, falling back to lite:", err.message);
+    const result = await liteAutofix(body);
+    return {
+      mode: "lite",
+      fallbackReason: err.message,
+      ...result,
+    };
+  }
+}
 
-  res.json({ ok: true, improvedText: improved });
-});
-
-module.exports = router;
+module.exports = { runAutofix };
