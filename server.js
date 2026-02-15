@@ -1,145 +1,220 @@
-'use strict';
-
-const express = require('express');
-const cors = require('cors');
-
-const { adminAuth } = require('./src/middleware/admin');
-const { routesSummary } = require('./src/routes');
-const { runValidityReport } = require('./src/validity');
-const { runDesign } = require('./src/design');
-const { upload, extractTextFromUpload } = require('./src/extract');
-const { buildReportPdfBuffer } = require('./src/export/pdf');
-const { buildReportDocxBuffer } = require('./src/export/docx');
+require("dotenv").config();
+const express = require("express");
+const cors = require("cors");
+const { callGroq, liteValidity } = require("./llm");
 
 const app = express();
-app.disable('x-powered-by');
+const PORT = process.env.PORT || 10000;
 
-// If you have a specific Netlify origin, set CORS_ORIGIN=https://your-site.netlify.app
-const corsOrigin = process.env.CORS_ORIGIN || '*';
-app.use(cors({ origin: corsOrigin }));
+app.use(cors());
+app.use(express.json({ limit: "5mb" }));
 
-app.use(express.json({ limit: '2mb' }));
+// In-memory history store (simple + safe for now)
+const history = [];
 
-// In-memory store (simple + free). Swap to a DB later if you want.
-const REPORTS = [];
-
-function nowISO() {
-  return new Date().toISOString();
-}
-
-app.get('/api/health', (req, res) => {
+/* ==============================
+   HEALTH
+============================== */
+app.get("/api/health", (req, res) => {
   res.json({
     ok: true,
-    name: 'ESL Validity Tool Backend',
-    timestamp: nowISO(),
-    groqConfigured: Boolean(process.env.GROQ_API_KEY),
-    adminConfigured: Boolean(process.env.ADMIN_KEY)
+    name: "ESL Validity Tool Backend",
+    groqConfigured: !!process.env.GROQ_API_KEY,
+    adminConfigured: !!process.env.ADMIN_KEY
   });
 });
 
-app.get('/api/routes', (req, res) => {
-  res.json({ ok: true, routes: routesSummary() });
-});
-
-// Optional: show a friendlier message at the root
-app.get('/', (req, res) => {
-  res.status(200).send('ESL Validity Tool Backend is running. Use /api/health');
-});
-
-// Extract text from uploaded files (pdf/docx/txt). Accepts multipart/form-data with field "file".
-app.post('/api/extract', upload.single('file'), async (req, res) => {
+/* ==============================
+   VALIDITY REPORT
+============================== */
+app.post("/api/report", async (req, res) => {
   try {
-    const text = await extractTextFromUpload(req.file);
-    res.json({ ok: true, text });
+    const {
+      skill,
+      levelFramework,
+      level,
+      purpose,
+      instructionsText,
+      rubricText,
+      mode = "lite"
+    } = req.body;
+
+    let result;
+
+    if (mode === "groq") {
+      if (!process.env.GROQ_API_KEY) {
+        return res.status(500).json({
+          ok: false,
+          error: "Groq not configured on server."
+        });
+      }
+
+      const messages = [
+        {
+          role: "system",
+          content:
+            "You are an ESL assessment validity expert. Provide structured JSON output only."
+        },
+        {
+          role: "user",
+          content: `
+Skill: ${skill}
+Framework: ${levelFramework}
+Level: ${level}
+Purpose: ${purpose}
+
+Instructions:
+${instructionsText}
+
+Rubric:
+${rubricText}
+
+Evaluate validity (clarity, alignment, measurability).
+Return structured JSON.
+`
+        }
+      ];
+
+      const content = await callGroq({
+        apiKey: process.env.GROQ_API_KEY,
+        messages
+      });
+
+      try {
+        result = JSON.parse(content);
+      } catch {
+        result = { mode: "groq", raw: content };
+      }
+    } else {
+      result = liteValidity({
+        skill,
+        levelFramework,
+        level,
+        purpose,
+        instructionsText,
+        rubricText
+      });
+    }
+
+    history.unshift({
+      id: Date.now(),
+      createdAt: new Date().toISOString(),
+      skill,
+      levelFramework,
+      level,
+      purpose,
+      result
+    });
+
+    res.json({ ok: true, result });
+
   } catch (err) {
-    res.status(400).json({ ok: false, error: err?.message || 'Extraction failed' });
+    console.error(err);
+    res.status(500).json({ ok: false, error: "Server error" });
   }
 });
 
-// Build a validity report from instructions + rubric
-app.post('/api/report', async (req, res) => {
+/* ==============================
+   DESIGN ASSESSMENT
+============================== */
+app.post("/api/design", async (req, res) => {
   try {
-    const input = req.body || {};
-    const report = await runValidityReport(input);
+    const {
+      skill,
+      levelFramework,
+      level,
+      purpose,
+      idea
+    } = req.body;
 
-    const id = String(Date.now()) + '-' + Math.random().toString(16).slice(2);
-    const record = {
-      id,
-      createdAt: nowISO(),
-      input,
-      report
-    };
-    REPORTS.unshift(record);
-    if (REPORTS.length > 100) REPORTS.length = 100;
+    if (!process.env.GROQ_API_KEY) {
+      return res.status(500).json({
+        ok: false,
+        error: "Groq not configured."
+      });
+    }
 
-    res.json({ ok: true, id, report });
+    const messages = [
+      {
+        role: "system",
+        content:
+          "You are an ESL assessment design expert. Create strong, valid assessment instructions and rubric."
+      },
+      {
+        role: "user",
+        content: `
+Design an ESL assessment.
+
+Skill: ${skill}
+Framework: ${levelFramework}
+Level: ${level}
+Purpose: ${purpose}
+
+Teacher idea:
+${idea}
+
+Ensure validity, reliability, positive washback.
+Return structured JSON with:
+- instructions
+- rubric (3-5 criteria with levels)
+`
+      }
+    ];
+
+    const content = await callGroq({
+      apiKey: process.env.GROQ_API_KEY,
+      messages
+    });
+
+    let parsed;
+    try {
+      parsed = JSON.parse(content);
+    } catch {
+      parsed = { raw: content };
+    }
+
+    res.json({ ok: true, result: parsed });
+
   } catch (err) {
-    res.status(500).json({ ok: false, error: err?.message || 'Report failed' });
+    console.error(err);
+    res.status(500).json({ ok: false, error: "Design error" });
   }
 });
 
-// NEW: Design an assessment (generate strong instructions + rubric) from teacher idea + criteria.
-app.post('/api/design', async (req, res) => {
-  try {
-    const input = req.body || {};
-    const design = await runDesign(input);
-    res.json({ ok: true, design });
-  } catch (err) {
-    res.status(500).json({ ok: false, error: err?.message || 'Design failed' });
+/* ==============================
+   EXTRACT TEXT (placeholder)
+============================== */
+app.post("/api/extract", async (req, res) => {
+  res.json({
+    ok: true,
+    message: "Text extraction endpoint placeholder."
+  });
+});
+
+/* ==============================
+   ADMIN HISTORY
+============================== */
+app.get("/api/history", (req, res) => {
+  const adminKey =
+    req.header("x-admin-key") ||
+    (req.header("authorization") || "").replace("Bearer ", "");
+
+  if (!adminKey || adminKey !== process.env.ADMIN_KEY) {
+    return res.status(401).json({ ok: false, error: "Unauthorized" });
   }
+
+  const limit = parseInt(req.query.limit || "20", 10);
+
+  res.json({
+    ok: true,
+    count: history.length,
+    items: history.slice(0, limit)
+  });
 });
 
-// Admin: list recent reports
-app.get('/api/history', adminAuth, (req, res) => {
-  const limit = Math.min(Number(req.query.limit || 20), 100);
-  res.json({ ok: true, items: REPORTS.slice(0, limit) });
-});
-
-// Admin: download report as PDF
-app.get('/api/report/:id/pdf', adminAuth, async (req, res) => {
-  const found = REPORTS.find(r => r.id === req.params.id);
-  if (!found) return res.status(404).json({ ok: false, error: 'Not found' });
-
-  const buf = await buildReportPdfBuffer(found);
-  res.setHeader('Content-Type', 'application/pdf');
-  res.setHeader('Content-Disposition', `attachment; filename="validity-report-${found.id}.pdf"`);
-  res.send(buf);
-});
-
-// Public: download by id (used by the teacher UI download buttons)
-app.get('/api/report/pdf', async (req, res) => {
-  const id = String(req.query.id || '');
-  const found = REPORTS.find(r => r.id === id);
-  if (!found) return res.status(404).json({ ok: false, error: 'Not found' });
-  const buf = await buildReportPdfBuffer(found);
-  res.setHeader('Content-Type', 'application/pdf');
-  res.setHeader('Content-Disposition', `attachment; filename="validity-report-${found.id}.pdf"`);
-  res.send(buf);
-});
-
-// Admin: download report as DOCX
-app.get('/api/report/:id/docx', adminAuth, async (req, res) => {
-  const found = REPORTS.find(r => r.id === req.params.id);
-  if (!found) return res.status(404).json({ ok: false, error: 'Not found' });
-
-  const buf = await buildReportDocxBuffer(found);
-  res.setHeader('Content-Type', 'application/vnd.openxmlformats-officedocument.wordprocessingml.document');
-  res.setHeader('Content-Disposition', `attachment; filename="validity-report-${found.id}.docx"`);
-  res.send(buf);
-});
-
-// Public: download by id (used by the teacher UI download buttons)
-app.get('/api/report/docx', async (req, res) => {
-  const id = String(req.query.id || '');
-  const found = REPORTS.find(r => r.id === id);
-  if (!found) return res.status(404).json({ ok: false, error: 'Not found' });
-  const buf = await buildReportDocxBuffer(found);
-  res.setHeader('Content-Type', 'application/vnd.openxmlformats-officedocument.wordprocessingml.document');
-  res.setHeader('Content-Disposition', `attachment; filename="validity-report-${found.id}.docx"`);
-  res.send(buf);
-});
-
-const port = process.env.PORT || 10000;
-app.listen(port, () => {
-  console.log(`Server running on port ${port}`);
+/* ==============================
+   START
+============================== */
+app.listen(PORT, () => {
+  console.log(`Server running on port ${PORT}`);
 });
