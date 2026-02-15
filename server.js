@@ -1,133 +1,111 @@
-// server.js (root)
+require("dotenv").config();
 const express = require("express");
 const cors = require("cors");
 
 const { runValidity } = require("./validity");
 const { runAutofix } = require("./autofix");
+const { requireAdmin } = require("./src/middleware/auth");
 
 const app = express();
 
-// ---- middleware ----
 app.use(cors());
-app.use(express.json({ limit: "1mb" }));
+app.use(express.json({ limit: "2mb" }));
 
-// ---- small helpers ----
-function requireAdmin(req, res, next) {
-  const expected = process.env.ADMIN_KEY || "";
-  const provided = req.header("x-admin-key") || "";
-  if (!expected) {
-    return res.status(500).json({
-      ok: false,
-      error: "ADMIN_KEY is not set on the server.",
-    });
-  }
-  if (provided !== expected) {
-    return res.status(401).json({ ok: false, error: "Unauthorized" });
-  }
-  next();
-}
+// In-memory history store
+const history = [];
 
-// ---- in-memory history (simple + free) ----
-const HISTORY = [];
-function addHistory(entry) {
-  HISTORY.push({ ...entry, at: new Date().toISOString() });
-  // keep last 200 so it never grows forever
-  if (HISTORY.length > 200) HISTORY.shift();
-}
-
-// ---- routes ----
+/* ===========================
+   HEALTH CHECK
+=========================== */
 app.get("/api/health", (req, res) => {
   res.json({
     ok: true,
     name: "ESL Validity Tool Backend",
     timestamp: new Date().toISOString(),
     groqConfigured: !!process.env.GROQ_API_KEY,
-    liteAvailable: true,
+    liteAvailable: true
   });
 });
 
-app.get("/api/routes", (req, res) => {
-  res.json({
-    routes: [
-      "GET  /api/health",
-      "GET  /api/routes",
-      "POST /api/validity",
-      "POST /api/report (alias of /api/validity)",
-      "POST /api/autofix",
-      "POST /api/fix (alias of /api/autofix)",
-      "GET  /api/history (admin)",
-    ],
-  });
-});
-
-// main: validity
-app.post("/api/validity", async (req, res) => {
+/* ===========================
+   REPORT (Groq or Lite)
+=========================== */
+app.post("/api/report", async (req, res) => {
   try {
-    const report = await runValidity(req.body, {
-      mode: req.query.mode, // "groq" | "lite" | undefined
+    const mode = req.query.mode || "groq";
+    const payload = req.body;
+
+    let result;
+
+    if (mode === "lite") {
+      result = await runValidity(payload, { mode: "lite" });
+    } else {
+      result = await runValidity(payload, { mode: "groq" });
+    }
+
+    history.push({
+      type: "report",
+      mode,
+      input: payload,
+      result,
+      timestamp: new Date().toISOString()
     });
 
-    addHistory({
-      type: "validity",
-      mode: report?.mode || "unknown",
-      inputMeta: {
-        skill: req.body?.skill,
-        levelFramework: req.body?.levelFramework,
-        level: req.body?.level,
-        purpose: req.body?.purpose,
-      },
-      ok: true,
-    });
+    res.json({ ok: true, report: result });
 
-    res.json({ ok: true, report });
-  } catch (err) {
-    addHistory({ type: "validity", ok: false, error: String(err?.message || err) });
-    res.status(500).json({ ok: false, error: String(err?.message || err) });
+  } catch (error) {
+    console.error("REPORT ERROR:", error);
+    res.status(500).json({
+      ok: false,
+      error: error.message || "Report failed"
+    });
   }
 });
 
-// alias
-app.post("/api/report", async (req, res) => {
-  // same handler as /api/validity
-  req.url = "/api/validity" + (req.url.includes("?") ? req.url.slice(req.url.indexOf("?")) : "");
-  return app._router.handle(req, res);
-});
-
-// main: autofix
+/* ===========================
+   AUTOFIX
+=========================== */
 app.post("/api/autofix", async (req, res) => {
   try {
-    const result = await runAutofix(req.body, {
-      mode: req.query.mode,
-    });
+    const payload = req.body;
+    const result = await runAutofix(payload);
 
-    addHistory({
+    history.push({
       type: "autofix",
-      mode: result?.mode || "unknown",
-      inputMeta: { hasText: !!req.body?.text },
-      ok: true,
+      input: payload,
+      result,
+      timestamp: new Date().toISOString()
     });
 
     res.json({ ok: true, result });
-  } catch (err) {
-    addHistory({ type: "autofix", ok: false, error: String(err?.message || err) });
-    res.status(500).json({ ok: false, error: String(err?.message || err) });
+
+  } catch (error) {
+    console.error("AUTOFIX ERROR:", error);
+    res.status(500).json({
+      ok: false,
+      error: error.message || "Autofix failed"
+    });
   }
 });
 
-// alias
-app.post("/api/fix", async (req, res) => {
-  req.url = "/api/autofix" + (req.url.includes("?") ? req.url.slice(req.url.indexOf("?")) : "");
-  return app._router.handle(req, res);
-});
-
-// admin: history
+/* ===========================
+   HISTORY (Admin Protected)
+=========================== */
 app.get("/api/history", requireAdmin, (req, res) => {
-  const limit = Math.max(1, Math.min(200, Number(req.query.limit || 50)));
-  res.json({ ok: true, items: HISTORY.slice(-limit).reverse() });
+  res.json({
+    ok: true,
+    count: history.length,
+    history
+  });
 });
 
-// ---- start ----
-const port = process.env.PORT || 10000;
-app.listen(port, () => {
-  console.log(`Server running on port ${port}`);
+/* ===========================
+   START SERVER
+=========================== */
+const PORT = process.env.PORT || 10000;
+
+app.listen(PORT, () => {
+  console.log("========================================");
+  console.log(`Server running on port ${PORT}`);
+  console.log("========================================");
 });
