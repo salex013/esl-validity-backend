@@ -1,120 +1,113 @@
-// src/autofix.js
-'use strict';
+// autofix.js (root)
 
-const GROQ_API_KEY = process.env.GROQ_API_KEY || '';
-const GROQ_BASE_URL = process.env.GROQ_BASE_URL || 'https://api.groq.com/openai/v1';
-const GROQ_MODEL = process.env.GROQ_MODEL || 'llama-3.1-8b-instant';
+async function groqChat({ system, user, temperature = 0.2 }) {
+  const apiKey = process.env.GROQ_API_KEY;
+  if (!apiKey) throw new Error("GROQ_API_KEY is not set.");
 
-function liteAutofix(input) {
-  const instructionsText = String(input?.instructionsText || '').trim();
-  const rubricText = String(input?.rubricText || '').trim();
-
-  const improvedInstructions =
-    instructionsText ||
-    'Students will complete the task described below. Include a clear time limit, required content, and what to submit.';
-
-  const improvedRubric =
-    rubricText ||
-    'Assessed on clarity, organization, vocabulary, and pronunciation. (Add 3 performance levels: developing / competent / strong.)';
-
-  const notes = [];
-  if (!/time|minute/i.test(improvedInstructions)) notes.push('Add a time limit (e.g., 2–3 minutes).');
-  if (!/submit|record|present|write/i.test(improvedInstructions)) notes.push('Add what students must submit/do.');
-  if (improvedRubric.length < 60) notes.push('Rubric is short; add 3 levels and descriptors.');
-
-  return {
-    mode: 'lite',
-    fixed: {
-      instructionsText: improvedInstructions,
-      rubricText: improvedRubric,
-    },
-    notes,
-  };
-}
-
-async function groqChatJSON(systemPrompt, userPrompt) {
-  if (!GROQ_API_KEY) throw new Error('GROQ_API_KEY is not set on the server.');
-
-  const resp = await fetch(`${GROQ_BASE_URL}/chat/completions`, {
-    method: 'POST',
+  const resp = await fetch("https://api.groq.com/openai/v1/chat/completions", {
+    method: "POST",
     headers: {
-      Authorization: `Bearer ${GROQ_API_KEY}`,
-      'Content-Type': 'application/json',
+      "Content-Type": "application/json",
+      Authorization: `Bearer ${apiKey}`,
     },
     body: JSON.stringify({
-      model: GROQ_MODEL,
-      temperature: 0.3,
+      model: "llama-3.1-8b-instant",
+      temperature,
       messages: [
-        { role: 'system', content: systemPrompt },
-        { role: 'user', content: userPrompt },
+        { role: "system", content: system },
+        { role: "user", content: user },
       ],
     }),
   });
 
   if (!resp.ok) {
-    const txt = await resp.text().catch(() => '');
-    throw new Error(`Groq error ${resp.status}: ${txt || resp.statusText}`);
+    const text = await resp.text().catch(() => "");
+    throw new Error(`Groq error ${resp.status}: ${text}`);
   }
 
   const data = await resp.json();
-  const content = data?.choices?.[0]?.message?.content || '';
+  return data?.choices?.[0]?.message?.content || "";
+}
 
-  const firstBrace = content.indexOf('{');
-  const lastBrace = content.lastIndexOf('}');
-  if (firstBrace === -1 || lastBrace === -1 || lastBrace <= firstBrace) {
-    throw new Error('Model did not return JSON.');
+function liteAutofix(input) {
+  const text = (input?.text || "").trim();
+  if (!text) {
+    return {
+      mode: "lite",
+      summary: "No text provided.",
+      improved: "",
+      changes: ["Provide `text` to autofix."],
+    };
   }
 
-  return JSON.parse(content.slice(firstBrace, lastBrace + 1));
-}
+  // super-light cleanup (safe + deterministic)
+  const improved = text
+    .replace(/\s+/g, " ")
+    .replace(/\s+\./g, ".")
+    .replace(/\s+,/g, ",")
+    .trim();
 
-async function groqAutofix(input) {
-  const systemPrompt =
-    `You are an expert ESL assessment editor. Return ONLY valid JSON (no markdown).`;
+  const changes = [];
+  if (improved !== text) changes.push("Normalized spacing and punctuation.");
+  else changes.push("No changes needed.");
 
-  const userPrompt = `
-Improve the assessment instructions and rubric to be clearer, measurable, and CLB/CEFR-friendly.
-Return JSON in this shape:
-{
-  "fixed": {
-    "instructionsText": string,
-    "rubricText": string
-  },
-  "notes": [string]
-}
-
-Input:
-skill: ${String(input?.skill || '')}
-levelFramework: ${String(input?.levelFramework || '')}
-level: ${String(input?.level || '')}
-purpose: ${String(input?.purpose || '')}
-
-instructionsText:
-${String(input?.instructionsText || '')}
-
-rubricText:
-${String(input?.rubricText || '')}
-`.trim();
-
-  const out = await groqChatJSON(systemPrompt, userPrompt);
-  out.mode = 'groq';
-  return out;
+  return {
+    mode: "lite",
+    summary: "Basic formatting cleanup (lite mode).",
+    improved,
+    changes,
+  };
 }
 
 async function runAutofix(input, opts = {}) {
-  const mode = (opts.mode || 'groq').toLowerCase() === 'lite' ? 'lite' : 'groq';
-  if (mode === 'lite') return liteAutofix(input);
+  const requestedMode = (opts.mode || "").toLowerCase(); // "groq" | "lite" | ""
+  const forceLite = requestedMode === "lite";
+  const forceGroq = requestedMode === "groq";
+
+  if (forceLite) return liteAutofix(input);
+
+  const hasGroq = !!process.env.GROQ_API_KEY;
+
+  if (!hasGroq && forceGroq) {
+    throw new Error("mode=groq requested but GROQ_API_KEY is not set.");
+  }
+
+  if (!hasGroq) return liteAutofix(input);
+
+  const system =
+    "You are an expert ESL editor. Return ONLY valid JSON. Be concise. Make changes that improve clarity, level-appropriateness, and rubric measurability.";
+
+  const user = `
+Return JSON:
+{
+  "mode": "groq",
+  "model": "<string>",
+  "summary": "<short>",
+  "improved": "<improved version of the text>",
+  "changes": ["..."]
+}
+
+Input:
+${JSON.stringify(input, null, 2)}
+`;
 
   try {
-    return await groqAutofix(input);
-  } catch (e) {
-    const fallback = liteAutofix(input);
-    fallback.mode = 'lite';
-    fallback.notes = [
-      ...(fallback.notes || []),
-      `Groq failed; returned lite fallback. (${e?.message || 'unknown error'})`,
-    ];
-    return fallback;
+    const raw = await groqChat({ system, user, temperature: 0.2 });
+
+    const jsonText = raw.trim().startsWith("{")
+      ? raw.trim()
+      : raw.slice(raw.indexOf("{"), raw.lastIndexOf("}") + 1);
+
+    const parsed = JSON.parse(jsonText);
+
+    return {
+      mode: "groq",
+      model: "llama-3.1-8b-instant",
+      ...parsed,
+    };
+  } catch (err) {
+    if (forceGroq) throw err;
+    return liteAutofix(input);
   }
 }
 
