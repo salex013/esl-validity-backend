@@ -1,310 +1,145 @@
-// server.js (ROOT) — CommonJS entrypoint for Render: `node server.js`
+'use strict';
 
-require("dotenv").config();
+const express = require('express');
+const cors = require('cors');
 
-const express = require("express");
-const cors = require("cors");
+const { adminAuth } = require('./src/middleware/admin');
+const { routesSummary } = require('./src/routes');
+const { runValidityReport } = require('./src/validity');
+const { runDesign } = require('./src/design');
+const { upload, extractTextFromUpload } = require('./src/extract');
+const { buildReportPdfBuffer } = require('./src/export/pdf');
+const { buildReportDocxBuffer } = require('./src/export/docx');
 
-const { callGroq, liteValidity } = require("./llm");
-
-// --------------------
-// App setup
-// --------------------
 const app = express();
+app.disable('x-powered-by');
 
-app.use(cors());
-app.use(express.json({ limit: "1mb" }));
+// If you have a specific Netlify origin, set CORS_ORIGIN=https://your-site.netlify.app
+const corsOrigin = process.env.CORS_ORIGIN || '*';
+app.use(cors({ origin: corsOrigin }));
 
-// --------------------
-// Simple admin auth (supports BOTH headers)
-// - x-admin-key: <key>
-// - Authorization: Bearer <key>
-// --------------------
-function getAdminKeyFromReq(req) {
-  const x = req.get("x-admin-key");
-  if (x) return x.trim();
+app.use(express.json({ limit: '2mb' }));
 
-  const auth = req.get("authorization");
-  if (!auth) return "";
-  const m = auth.match(/^Bearer\s+(.+)$/i);
-  return m ? m[1].trim() : "";
-}
+// In-memory store (simple + free). Swap to a DB later if you want.
+const REPORTS = [];
 
-function adminOnly(req, res, next) {
-  const expected = (process.env.ADMIN_KEY || "").trim();
-  if (!expected) {
-    return res.status(500).json({ ok: false, error: "ADMIN_KEY is not set on the server." });
-  }
-  const provided = getAdminKeyFromReq(req);
-
-  // constant-ish compare (good enough for this use case)
-  if (provided.length !== expected.length) {
-    return res.status(401).json({ ok: false, error: "Unauthorized" });
-  }
-  let mismatch = 0;
-  for (let i = 0; i < expected.length; i++) mismatch |= expected.charCodeAt(i) ^ provided.charCodeAt(i);
-  if (mismatch !== 0) {
-    return res.status(401).json({ ok: false, error: "Unauthorized" });
-  }
-  next();
-}
-
-// --------------------
-// In-memory history (safe + simple for Render free tier)
-// --------------------
-const HISTORY = [];
-const HISTORY_MAX = 200;
-
-function addHistory(entry) {
-  HISTORY.unshift(entry);
-  if (HISTORY.length > HISTORY_MAX) HISTORY.length = HISTORY_MAX;
-}
-
-// --------------------
-// Helpers
-// --------------------
-function nowIso() {
+function nowISO() {
   return new Date().toISOString();
 }
 
-function requireFields(body, fields) {
-  const missing = [];
-  for (const f of fields) {
-    if (body[f] === undefined || body[f] === null || String(body[f]).trim() === "") missing.push(f);
-  }
-  return missing;
-}
-
-function buildGroqMessages(payload) {
-  const {
-    skill,
-    levelFramework,
-    level,
-    purpose,
-    instructionsText,
-    rubricText
-  } = payload;
-
-  return [
-    {
-      role: "system",
-      content:
-        "You are an ESL/EAP Assessment Designer and Validator. Return STRICT JSON only (no markdown)."
-    },
-    {
-      role: "user",
-      content:
-        [
-          "Validate the assessment for alignment, clarity, measurability, fairness/accessibility, and rubric quality.",
-          "Return JSON with this shape:",
-          `{`,
-          `  "summary": string,`,
-          `  "strengths": string[],`,
-          `  "issues": string[],`,
-          `  "suggestions": string[],`,
-          `  "scores": { "clarity": 1|2|3|4, "alignment": 1|2|3|4, "measurability": 1|2|3|4, "fairness_accessibility": 1|2|3|4 },`,
-          `  "overall": { "band": 1|2|3|4, "label": "Approaches"|"Meets"|"Exceeds" },`,
-          `  "riskLevel": "low"|"medium"|"high"`,
-          `}`,
-          "",
-          `Skill: ${skill}`,
-          `Framework: ${levelFramework}`,
-          `Level: ${level}`,
-          `Purpose: ${purpose}`,
-          "",
-          `Instructions: ${instructionsText}`,
-          "",
-          `Rubric: ${rubricText}`
-        ].join("\n")
-    }
-  ];
-}
-
-function safeJsonParse(maybeJsonText) {
-  // Try strict parse first
-  try {
-    return JSON.parse(maybeJsonText);
-  } catch (_) {}
-
-  // Try to extract the first {...} block (in case model added extra text)
-  const start = maybeJsonText.indexOf("{");
-  const end = maybeJsonText.lastIndexOf("}");
-  if (start >= 0 && end > start) {
-    const slice = maybeJsonText.slice(start, end + 1);
-    try {
-      return JSON.parse(slice);
-    } catch (_) {}
-  }
-
-  return null;
-}
-
-// --------------------
-// Routes
-// --------------------
-app.get("/api/health", (req, res) => {
+app.get('/api/health', (req, res) => {
   res.json({
     ok: true,
-    name: "ESL Validity Tool Backend",
-    timestamp: nowIso(),
-    groqConfigured: !!process.env.GROQ_API_KEY,
-    liteAvailable: true
+    name: 'ESL Validity Tool Backend',
+    timestamp: nowISO(),
+    groqConfigured: Boolean(process.env.GROQ_API_KEY),
+    adminConfigured: Boolean(process.env.ADMIN_KEY)
   });
 });
 
-app.get("/api/routes", (req, res) => {
-  res.json({
-    routes: [
-      "GET  /api/health",
-      "GET  /api/routes",
-      "GET  /api/status",
-      "POST /api/report",
-      "GET  /api/history?limit=20 (admin)",
-    ]
-  });
+app.get('/api/routes', (req, res) => {
+  res.json({ ok: true, routes: routesSummary() });
 });
 
-app.get("/api/status", (req, res) => {
-  res.json({
-    ok: true,
-    timestamp: nowIso(),
-    env: {
-      hasAdminKey: !!process.env.ADMIN_KEY,
-      hasGroqKey: !!process.env.GROQ_API_KEY
-    },
-    defaults: {
-      model: process.env.GROQ_MODEL || "llama-3.3-70b-versatile",
-      temperature: process.env.GROQ_TEMP ? Number(process.env.GROQ_TEMP) : 0.2
-    }
-  });
+// Optional: show a friendlier message at the root
+app.get('/', (req, res) => {
+  res.status(200).send('ESL Validity Tool Backend is running. Use /api/health');
 });
 
-/**
- * POST /api/report
- * Body:
- * {
- *   skill, levelFramework, level, purpose,
- *   instructionsText, rubricText,
- *   model?, temperature?
- * }
- *
- * Query:
- *   ?mode=lite   -> uses liteValidity()
- *   (default)    -> uses Groq if configured; otherwise lite fallback
- */
-app.post("/api/report", async (req, res) => {
+// Extract text from uploaded files (pdf/docx/txt). Accepts multipart/form-data with field "file".
+app.post('/api/extract', upload.single('file'), async (req, res) => {
   try {
-    const payload = req.body || {};
-
-    const missing = requireFields(payload, [
-      "skill",
-      "levelFramework",
-      "level",
-      "purpose",
-      "instructionsText",
-      "rubricText"
-    ]);
-    if (missing.length) {
-      return res.status(400).json({ ok: false, error: `Missing: ${missing.join(", ")}` });
-    }
-
-    const mode = (req.query.mode || "").toString().toLowerCase().trim();
-
-    // Always allow explicit lite mode
-    if (mode === "lite") {
-      const report = liteValidity(payload);
-      addHistory({ id: cryptoRandomId(), ts: nowIso(), mode: "lite", input: summarizeInput(payload), report });
-      return res.json({ ok: true, report });
-    }
-
-    // If Groq not configured, fallback to lite
-    const apiKey = (process.env.GROQ_API_KEY || "").trim();
-    if (!apiKey) {
-      const report = liteValidity(payload);
-      addHistory({ id: cryptoRandomId(), ts: nowIso(), mode: "lite", input: summarizeInput(payload), report });
-      return res.json({
-        ok: true,
-        report: {
-          ...report,
-          summary: "Groq not configured on server; returned lite checks."
-        }
-      });
-    }
-
-    const model = (payload.model || process.env.GROQ_MODEL || "llama-3.3-70b-versatile").trim();
-    const temperature =
-      payload.temperature !== undefined
-        ? Number(payload.temperature)
-        : process.env.GROQ_TEMP
-          ? Number(process.env.GROQ_TEMP)
-          : 0.2;
-
-    // Use your llm.js helper to call Groq
-    const messages = buildGroqMessages(payload);
-    const content = await callGroq({ apiKey, messages, model, temperature });
-
-    const parsed = safeJsonParse(content);
-    let report;
-
-    if (parsed && typeof parsed === "object") {
-      report = {
-        mode: "groq",
-        model,
-        ...parsed
-      };
-    } else {
-      // If model output isn't parseable JSON, fallback to lite + include raw
-      const lite = liteValidity(payload);
-      report = {
-        ...lite,
-        mode: "lite",
-        summary: "Groq returned non-JSON output; returned lite checks instead.",
-        groqRaw: String(content || "").slice(0, 4000)
-      };
-    }
-
-    addHistory({ id: cryptoRandomId(), ts: nowIso(), mode: report.mode, model, input: summarizeInput(payload), report });
-    return res.json({ ok: true, report });
-
+    const text = await extractTextFromUpload(req.file);
+    res.json({ ok: true, text });
   } catch (err) {
-    return res.status(500).json({
-      ok: false,
-      error: err?.message || "Server error"
-    });
+    res.status(400).json({ ok: false, error: err?.message || 'Extraction failed' });
   }
 });
 
-app.get("/api/history", adminOnly, (req, res) => {
-  const limit = Math.max(1, Math.min(200, Number(req.query.limit || 20)));
-  res.json({ ok: true, count: Math.min(limit, HISTORY.length), items: HISTORY.slice(0, limit) });
-});
-
-// --------------------
-// Start
-// --------------------
-const PORT = process.env.PORT || 10000;
-
-app.listen(PORT, () => {
-  console.log(`Server running on port ${PORT}`);
-});
-
-// --------------------
-// Small utilities
-// --------------------
-function cryptoRandomId() {
-  // Node 18+ has global crypto
+// Build a validity report from instructions + rubric
+app.post('/api/report', async (req, res) => {
   try {
-    return crypto.randomUUID();
-  } catch (_) {
-    return `${Date.now()}-${Math.random().toString(16).slice(2)}`;
-  }
-}
+    const input = req.body || {};
+    const report = await runValidityReport(input);
 
-function summarizeInput(p) {
-  return {
-    skill: p.skill,
-    levelFramework: p.levelFramework,
-    level: p.level,
-    purpose: p.purpose
-  };
-}
+    const id = String(Date.now()) + '-' + Math.random().toString(16).slice(2);
+    const record = {
+      id,
+      createdAt: nowISO(),
+      input,
+      report
+    };
+    REPORTS.unshift(record);
+    if (REPORTS.length > 100) REPORTS.length = 100;
+
+    res.json({ ok: true, id, report });
+  } catch (err) {
+    res.status(500).json({ ok: false, error: err?.message || 'Report failed' });
+  }
+});
+
+// NEW: Design an assessment (generate strong instructions + rubric) from teacher idea + criteria.
+app.post('/api/design', async (req, res) => {
+  try {
+    const input = req.body || {};
+    const design = await runDesign(input);
+    res.json({ ok: true, design });
+  } catch (err) {
+    res.status(500).json({ ok: false, error: err?.message || 'Design failed' });
+  }
+});
+
+// Admin: list recent reports
+app.get('/api/history', adminAuth, (req, res) => {
+  const limit = Math.min(Number(req.query.limit || 20), 100);
+  res.json({ ok: true, items: REPORTS.slice(0, limit) });
+});
+
+// Admin: download report as PDF
+app.get('/api/report/:id/pdf', adminAuth, async (req, res) => {
+  const found = REPORTS.find(r => r.id === req.params.id);
+  if (!found) return res.status(404).json({ ok: false, error: 'Not found' });
+
+  const buf = await buildReportPdfBuffer(found);
+  res.setHeader('Content-Type', 'application/pdf');
+  res.setHeader('Content-Disposition', `attachment; filename="validity-report-${found.id}.pdf"`);
+  res.send(buf);
+});
+
+// Public: download by id (used by the teacher UI download buttons)
+app.get('/api/report/pdf', async (req, res) => {
+  const id = String(req.query.id || '');
+  const found = REPORTS.find(r => r.id === id);
+  if (!found) return res.status(404).json({ ok: false, error: 'Not found' });
+  const buf = await buildReportPdfBuffer(found);
+  res.setHeader('Content-Type', 'application/pdf');
+  res.setHeader('Content-Disposition', `attachment; filename="validity-report-${found.id}.pdf"`);
+  res.send(buf);
+});
+
+// Admin: download report as DOCX
+app.get('/api/report/:id/docx', adminAuth, async (req, res) => {
+  const found = REPORTS.find(r => r.id === req.params.id);
+  if (!found) return res.status(404).json({ ok: false, error: 'Not found' });
+
+  const buf = await buildReportDocxBuffer(found);
+  res.setHeader('Content-Type', 'application/vnd.openxmlformats-officedocument.wordprocessingml.document');
+  res.setHeader('Content-Disposition', `attachment; filename="validity-report-${found.id}.docx"`);
+  res.send(buf);
+});
+
+// Public: download by id (used by the teacher UI download buttons)
+app.get('/api/report/docx', async (req, res) => {
+  const id = String(req.query.id || '');
+  const found = REPORTS.find(r => r.id === id);
+  if (!found) return res.status(404).json({ ok: false, error: 'Not found' });
+  const buf = await buildReportDocxBuffer(found);
+  res.setHeader('Content-Type', 'application/vnd.openxmlformats-officedocument.wordprocessingml.document');
+  res.setHeader('Content-Disposition', `attachment; filename="validity-report-${found.id}.docx"`);
+  res.send(buf);
+});
+
+const port = process.env.PORT || 10000;
+app.listen(port, () => {
+  console.log(`Server running on port ${port}`);
+});
