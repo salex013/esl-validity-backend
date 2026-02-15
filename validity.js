@@ -1,25 +1,16 @@
-// src/validity.js
+// src/autofix.js
 
-async function runValidity({ skill, levelFramework, level, purpose, instructionsText, rubricText }) {
+async function runAutofix({ instructionsText, rubricText }) {
 
-  // Basic validation
-  if (!skill || !levelFramework || !level) {
-    throw new Error("Missing required fields")
-  }
-
-  // Simple structured output (you can plug Groq here later)
   return {
-    summary: `This ${skill} task aligns with ${levelFramework} Level ${level}.`,
-    strengths: [
-      "Clear task purpose",
-      "Appropriate performance expectations"
-    ],
-    improvements: [
-      "Clarify rubric descriptors",
-      "Specify measurable outcomes"
-    ],
-    overallRating: "Appropriate with minor refinements suggested"
+    improvedInstructions: instructionsText
+      ? instructionsText + "\n\nPlease ensure instructions are measurable and aligned to criteria."
+      : "",
+
+    improvedRubric: rubricText
+      ? rubricText + "\n\nDescriptors should clearly distinguish performance levels."
+      : ""
   }
 }
 
-module.exports = runValidity
+module.exports = runAutofix
