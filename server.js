@@ -3,25 +3,11 @@ import cors from "cors";
 
 const app = express();
 
-/**
- * IMPORTANT:
- * Set this in Render env if you want to restrict requests:
- * FRONTEND_ORIGIN=https://assessment-checker-sheridan-eap.netlify.app
- *
- * If not set, it will allow all origins (fine for testing).
- */
-const FRONTEND_ORIGIN = (process.env.FRONTEND_ORIGIN || "").trim();
-
-app.use(
-  cors({
-    origin: FRONTEND_ORIGIN ? FRONTEND_ORIGIN : true,
-    methods: ["GET", "POST", "OPTIONS"],
-    allowedHeaders: ["Content-Type", "x-admin-key"],
-  })
-);
+// --- basics ---
+app.use(cors());
 app.use(express.json({ limit: "2mb" }));
 
-// --- admin auth (only for admin routes; DO NOT require this from browser UI) ---
+// --- admin auth (optional) ---
 function getAdminKeyFromRequest(req) {
   return (
     req.get("x-admin-key") ||
@@ -39,149 +25,147 @@ function getExpectedAdminKey() {
 
 function requireAdmin(req, res, next) {
   const expected = getExpectedAdminKey();
+
   if (!expected) {
     return res.status(500).json({
       ok: false,
       error: "ADMIN_KEY is not set on the server (Render Environment).",
     });
   }
+
   const provided = getAdminKeyFromRequest(req);
+
   if (!provided || provided !== expected) {
     return res.status(401).json({ ok: false, error: "Unauthorized" });
   }
+
   return next();
 }
 
-// ---------------------------
-// Rule-based analysis core
-// ---------------------------
-function basicScan({ instructions = "", rubric = "", meta = {} }) {
-  const issues = [];
-  const tips = [];
-  const strengths = [];
-
-  const outcomes = (meta.learningOutcomes || "").trim();
-  const desc = (meta.description || "").trim();
-
-  const hasOutcomes = outcomes.length > 0;
-  const hasDesc = desc.length > 0;
-
-  const hasTime = /time\s*(limit|allowed)|\b\d+\s*(min|mins|minutes|hour|hours)\b/i.test(
-    instructions
-  );
-  const hasSubmission = /submit|upload|format|pdf|docx|audio|record/i.test(instructions);
-
-  const mentionsCriteria = /criteria/i.test(rubric);
-  const mentionsLevels = /exceeds|meets|developing|beginning|excellent|good|satisfactory/i.test(
-    rubric
-  );
-  const mentionsWeight = /out of|\/\s*\d+|%|points/i.test(rubric);
-
-  if (hasOutcomes) strengths.push("Learning outcomes provided (supports alignment checking).");
-  if (hasDesc) strengths.push("Task description provided (supports construct/content validity).");
-  if (hasTime) strengths.push("Time guidance is present (supports practicality/fairness).");
-  if (hasSubmission) strengths.push("Submission format is present (supports practicality).");
-
-  if (!hasOutcomes) issues.push("Learning outcomes missing → alignment is difficult to justify.");
-  if (!hasDesc) tips.push("Add a clearer task description/prompt to improve authenticity.");
-  if (!hasTime) tips.push("Add a clear time limit to strengthen practicality and fairness.");
-  if (!hasSubmission) tips.push("Add a submission format (DOCX/PDF/audio) for practicality.");
-
-  if (!mentionsCriteria) tips.push("Rubric should clearly name criteria (e.g., Task completion, Language control).");
-  if (!mentionsLevels) tips.push("Rubric should show performance levels (Exceeds/Meets/Developing/Beginning).");
-  if (!mentionsWeight) tips.push("Rubric should show weighting (e.g., Out of 10) to support reliability.");
-
-  // crude washback signal
-  const hasFeedbackLanguage = /feedback|next time|to improve|work on|strengths|areas to/i.test(
-    instructions + "\n" + rubric
-  );
-  if (!hasFeedbackLanguage) tips.push("Add feedback-oriented language to increase positive washback.");
-
-  // scores (simple, deterministic)
-  const alignment = hasOutcomes ? 0.78 : 0.55;
-  const washback = hasFeedbackLanguage ? 0.78 : 0.62;
-  const fairness = hasTime ? 0.78 : 0.60;
-  const practicality = hasTime && hasSubmission ? 0.84 : 0.60;
-
-  return {
-    scores: { alignment, washback, fairness, practicality },
-    strengths,
-    issues,
-    tips,
-  };
+// --- helpers ---
+function cleanStr(x) {
+  return (x ?? "").toString().trim();
 }
 
-function buildDefaultRubricTable(meta = {}) {
-  // SLATE-like columns
+function basicRubricTable({ levelFramework, level, skill }) {
+  // Matches the SLATE-style columns you showed
   return {
-    columns: ["Criteria", "Out of", "Exceeds", "Meets", "Developing", "Beginning", "Criterion score"],
+    columns: [
+      "Criteria",
+      "Out of",
+      "Exceeds expectations (80%+)",
+      "Meets expectations (70–79%)",
+      "Needs some improvement (60–69%)",
+      "Did not achieve (59% or lower)",
+      "Criterion score",
+    ],
     rows: [
       {
         criteria: "Task completion",
-        outOf: "10",
-        exceeds: "Fully completes all parts with strong detail and accuracy.",
-        meets: "Completes most parts with generally clear, accurate work.",
-        developing: "Partially completes the task; missing detail or clarity in places.",
-        beginning: "Limited completion; unclear or incomplete response.",
+        outOf: " / 5",
+        exceeds: "All required parts completed fully and appropriately.",
+        meets: "Most required parts completed; minor gaps.",
+        developing: "Some parts incomplete or unclear; important details missing.",
+        beginning: "Task mostly incomplete or does not meet requirements.",
         score: "",
       },
       {
-        criteria: "Language control",
-        outOf: "10",
-        exceeds: "Consistently accurate grammar/vocabulary for the level; errors are rare.",
-        meets: "Mostly accurate; errors do not block meaning.",
-        developing: "Frequent errors sometimes affect meaning.",
-        beginning: "Errors often block meaning; limited control of forms.",
+        criteria: "Organization / coherence",
+        outOf: " / 5",
+        exceeds: "Very clear, logical flow; easy to follow.",
+        meets: "Generally clear; a few small organization issues.",
+        developing: "Some confusion; ideas not always connected clearly.",
+        beginning: "Hard to follow; organization prevents understanding.",
         score: "",
       },
       {
-        criteria: "Organization & clarity",
-        outOf: "10",
-        exceeds: "Very clear organization; easy to follow throughout.",
-        meets: "Clear overall; minor lapses.",
-        developing: "Some organization; hard to follow at times.",
-        beginning: "Unclear organization; difficult to follow.",
+        criteria: "Language use (grammar & vocab)",
+        outOf: " / 5",
+        exceeds: `Strong control for ${levelFramework} ${level}; accurate range and word choice.`,
+        meets: `Appropriate for ${levelFramework} ${level}; some errors but meaning is clear.`,
+        developing: "Limited range; frequent errors that sometimes affect meaning.",
+        beginning: "Very limited control; errors often block meaning.",
+        score: "",
+      },
+      {
+        criteria: skill === "Speaking" ? "Fluency & pronunciation" : "Mechanics / clarity",
+        outOf: " / 5",
+        exceeds: "Smooth, clear, confident; very easy to understand.",
+        meets: "Mostly clear; a few issues do not interrupt understanding.",
+        developing: "Sometimes unclear; listener/reader must work to understand.",
+        beginning: "Often unclear; communication breaks down.",
         score: "",
       },
     ],
   };
 }
 
-function buildDefaultInstructions(meta = {}) {
-  const skill = (meta.skill || "Assessment").toString();
-  const level = `${meta.levelFramework || ""} ${meta.level || ""}`.trim();
+function basicInstructions({ levelFramework, level, skill, purpose, assessmentType, description, learningOutcomes }) {
+  const header = `Assessment Instructions (${levelFramework} ${level})`;
+  const bullets = [
+    "Read the task carefully.",
+    "Complete the task using language that matches your level.",
+    "Submit your work by the deadline (your teacher will confirm).",
+  ];
+
+  const include = [
+    skill === "Speaking" ? "Clear pronunciation and an appropriate pace" : "Clear writing that is easy to follow",
+    "A clear main idea and supporting details",
+    "Relevant vocabulary for the topic",
+  ];
 
   return [
-    `## Assessment Instructions`,
-    ``,
-    `**Skill:** ${skill}`,
-    level ? `**Level:** ${level}` : ``,
-    ``,
-    `### Goal`,
-    `Complete the task using appropriate language for your level.`,
-    ``,
-    `### What to do`,
-    `1. Read the prompt carefully.`,
-    `2. Plan your response (brainstorm / outline).`,
-    `3. Complete the task.`,
-    `4. Review for clarity, grammar, and vocabulary.`,
-    ``,
-    `### Time`,
-    `30–45 minutes (teacher may adjust).`,
-    ``,
-    `### Submission`,
-    `Upload a **DOCX or PDF** (or submit audio if assigned).`,
-    ``,
-    `### Success criteria (summary)`,
-    `You will be evaluated on task completion, language control, and organization/clarity.`,
-  ]
-    .filter(Boolean)
-    .join("\n");
+    header,
+    "",
+    `Skill: ${skill}`,
+    `Assessment type: ${assessmentType}`,
+    `Purpose: ${purpose}`,
+    "",
+    "Task:",
+    description ? description : "(teacher will provide)",
+    "",
+    "Steps:",
+    ...bullets.map((b, i) => `${i + 1}) ${b}`),
+    "",
+    "What to include:",
+    ...include.map((x) => `• ${x}`),
+    "",
+    "Learning outcomes (teacher input):",
+    learningOutcomes ? learningOutcomes : "(none provided)",
+  ].join("\n");
 }
 
-// ---------------------------
-// ROUTES
-// ---------------------------
+function basicValidityReportHtml({ instructions, rubric }) {
+  const issues = [];
+
+  if (!instructions || instructions.length < 80) issues.push("Instructions are very short — students may not understand expectations.");
+  if (!rubric || rubric.length < 80) issues.push("Rubric text is very short — criteria and performance levels may be unclear.");
+
+  // simple “washback” heuristics
+  if (instructions.toLowerCase().includes("grammar") && !instructions.toLowerCase().includes("meaning")) {
+    issues.push("Washback risk: focus may skew toward grammar accuracy over meaning/communication.");
+  }
+
+  const score = Math.max(1, 5 - issues.length); // quick, transparent heuristic
+
+  return `
+    <div>
+      <p><strong>Overall signal:</strong> <span style="padding:6px 10px;border:2px solid #d4af37;border-radius:999px;color:#d4af37;font-weight:800;">${score}/5</span></p>
+      <h3>Validity & washback notes</h3>
+      <ul>
+        ${issues.length ? issues.map(i => `<li>${i}</li>`).join("") : "<li>Looks solid based on the text provided.</li>"}
+      </ul>
+      <h3>Recommendations</h3>
+      <ul>
+        <li>Add clearer success criteria (“what good looks like”) in student-friendly language.</li>
+        <li>Ensure rubric criteria align directly to the learning outcomes (content validity).</li>
+        <li>Add positive, actionable descriptors to encourage good washback (strategy + communication).</li>
+      </ul>
+    </div>
+  `;
+}
+
+// --- routes ---
 app.get("/", (req, res) => {
   res.json({
     ok: true,
@@ -189,7 +173,6 @@ app.get("/", (req, res) => {
     timestamp: new Date().toISOString(),
     adminConfigured: Boolean(getExpectedAdminKey()),
     groqConfigured: Boolean(process.env.GROQ_API_KEY),
-    frontendOrigin: FRONTEND_ORIGIN || "(any)",
   });
 });
 
@@ -205,77 +188,71 @@ app.get("/api/admin/ping", requireAdmin, (req, res) => {
   res.json({ ok: true, admin: true, timestamp: new Date().toISOString() });
 });
 
-// ✅ Generate a package (instructions + rubric table)
+// ✅ NEW: generate
 app.post("/api/generate", async (req, res) => {
   try {
-    const meta = req.body || {};
-    const instructionsMarkdown = buildDefaultInstructions(meta);
-    const rubricTable = buildDefaultRubricTable(meta);
+    const skill = cleanStr(req.body.skill) || "Speaking";
+    const levelFramework = cleanStr(req.body.levelFramework) || "CLB";
+    const level = cleanStr(req.body.level) || "5";
+    const purpose = cleanStr(req.body.purpose) || "Formative";
+    const assessmentType = cleanStr(req.body.assessmentType) || "Task";
+    const description = cleanStr(req.body.description);
+    const learningOutcomes = cleanStr(req.body.learningOutcomes);
+
+    const instructionsMarkdown = basicInstructions({
+      levelFramework, level, skill, purpose, assessmentType, description, learningOutcomes
+    });
+
+    const rubricTable = basicRubricTable({ levelFramework, level, skill });
 
     return res.json({
       ok: true,
-      generated: {
-        instructionsMarkdown,
-        rubricTable,
-      },
+      generated: { instructionsMarkdown, rubricTable },
     });
-  } catch (e) {
-    console.error(e);
+  } catch (err) {
+    console.error("Generate error:", err);
     return res.status(500).json({ ok: false, error: "Generate failed." });
   }
 });
 
-// ✅ Analyze validity/washback + return improved versions + report
+// ✅ NEW: analyze
 app.post("/api/analyze", async (req, res) => {
   try {
-    const { instructions = "", rubric = "", meta = {} } = req.body || {};
+    const instructions = cleanStr(req.body.instructions);
+    const rubric = cleanStr(req.body.rubric);
+    const meta = req.body.meta || {};
 
-    if (!instructions.trim() && !rubric.trim()) {
-      return res.status(400).json({ ok: false, error: "Provide instructions and/or rubric." });
-    }
+    const reportHtml = basicValidityReportHtml({ instructions, rubric });
 
-    const scan = basicScan({ instructions, rubric, meta });
+    // “Improved” versions (simple starter version; you can upgrade with Groq later)
+    const improvedInstructionsText = instructions
+      ? instructions + "\n\n(Improvement) Add: time limit, submission format, and a model/example response."
+      : basicInstructions({
+          levelFramework: meta.levelFramework || "CLB",
+          level: meta.level || "5",
+          skill: meta.skill || "Speaking",
+          purpose: meta.purpose || "Formative",
+          assessmentType: meta.assessmentType || "Task",
+          description: meta.description || "",
+          learningOutcomes: meta.learningOutcomes || "",
+        });
 
-    // “Improved” versions (rule-based)
-    const improvedInstructions = instructions.trim()
-      ? `${instructions.trim()}\n\n---\n**Improvements added:** Clear time + submission + success criteria language for positive washback.`
-      : buildDefaultInstructions(meta);
-
-    const improvedRubricTable = buildDefaultRubricTable(meta);
-
-    const pct = (x) => `${Math.round(x * 100)}%`;
-
-    const reportHtml = `
-      <h3>Validity & Washback Report</h3>
-      <p><strong>Alignment:</strong> ${pct(scan.scores.alignment)}</p>
-      <p><strong>Washback:</strong> ${pct(scan.scores.washback)}</p>
-      <p><strong>Fairness:</strong> ${pct(scan.scores.fairness)}</p>
-      <p><strong>Practicality:</strong> ${pct(scan.scores.practicality)}</p>
-
-      ${scan.strengths?.length ? `<h4>Strengths</h4><ul>${scan.strengths
-        .map((x) => `<li>${x}</li>`)
-        .join("")}</ul>` : ""}
-
-      ${scan.issues?.length ? `<h4>Issues</h4><ul>${scan.issues
-        .map((x) => `<li>${x}</li>`)
-        .join("")}</ul>` : ""}
-
-      ${scan.tips?.length ? `<h4>Recommendations</h4><ul>${scan.tips
-        .map((x) => `<li>${x}</li>`)
-        .join("")}</ul>` : ""}
-    `;
+    const improvedRubricTable = basicRubricTable({
+      levelFramework: meta.levelFramework || "CLB",
+      level: meta.level || "5",
+      skill: meta.skill || "Speaking",
+    });
 
     return res.json({
       ok: true,
-      scan,
+      reportHtml,
       improved: {
-        instructionsText: improvedInstructions,
+        instructionsText: improvedInstructionsText,
         rubricTable: improvedRubricTable,
       },
-      reportHtml,
     });
-  } catch (e) {
-    console.error(e);
+  } catch (err) {
+    console.error("Analyze error:", err);
     return res.status(500).json({ ok: false, error: "Analyze failed." });
   }
 });
@@ -285,8 +262,16 @@ app.use((req, res) => {
   res.status(404).json({ ok: false, error: "Route not found" });
 });
 
+// --- error handler ---
+app.use((err, req, res, next) => {
+  console.error("Server error:", err);
+  res.status(500).json({ ok: false, error: "Internal server error" });
+});
+
 // --- start ---
 const PORT = process.env.PORT || 3000;
 app.listen(PORT, () => {
   console.log(`🚀 Server running on port ${PORT}`);
+  console.log("ADMIN_KEY set:", Boolean(process.env.ADMIN_KEY));
+  console.log("GROQ_API_KEY set:", Boolean(process.env.GROQ_API_KEY));
 });
