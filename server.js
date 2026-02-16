@@ -1,61 +1,65 @@
-// src/server.js
 import express from "express";
 import cors from "cors";
 import dotenv from "dotenv";
+import { requireAdmin } from "./middleware/admin.js";
 
+// Load env (works locally; Render provides env automatically)
 dotenv.config();
 
 const app = express();
 
-// ---- middleware ----
+// ---------- Basic Middleware ----------
 app.use(cors());
-app.use(express.json({ limit: "5mb" }));
+app.use(express.json());
 
-// ---- ADMIN AUTH (INLINE: no external file needed) ----
-function requireAdmin(req, res, next) {
-  const expected = process.env.ADMIN_KEY;
-
-  if (!expected) {
-    return res.status(500).json({
-      ok: false,
-      error: "ADMIN_KEY not configured on server",
-    });
-  }
-
-  const got =
-    req.get("x-admin-key") ||
-    req.get("X-Admin-Key") ||
-    (req.query && req.query.admin_key) ||
-    "";
-
-  if (got !== expected) {
-    return res.status(401).json({ ok: false, error: "Unauthorized" });
-  }
-
-  next();
-}
-
-// ---- health ----
-app.get("/api/health", (req, res) => {
+// ---------- Health Check ----------
+app.get("/", (req, res) => {
   res.json({
     ok: true,
     name: "ESL Validity Tool Backend",
     timestamp: new Date().toISOString(),
-    adminConfigured: !!process.env.ADMIN_KEY,
-    groqConfigured: !!process.env.GROQ_API_KEY,
+    adminConfigured: Boolean(process.env.ADMIN_KEY),
+    groqConfigured: Boolean(process.env.GROQ_API_KEY),
   });
 });
 
-// ---- example admin route (keep/remove as you like) ----
+// ---------- Admin Ping (Protected) ----------
 app.get("/api/admin/ping", requireAdmin, (req, res) => {
-  res.json({ ok: true, admin: true });
+  res.json({
+    ok: true,
+    message: "Admin authenticated",
+  });
 });
 
-// ---- 404 ----
+// ---------- Example Protected Route ----------
+app.post("/api/admin/test", requireAdmin, (req, res) => {
+  res.json({
+    ok: true,
+    received: req.body,
+  });
+});
+
+// ---------- 404 Catch ----------
 app.use((req, res) => {
-  res.status(404).json({ ok: false, error: "Not found" });
+  res.status(404).json({
+    ok: false,
+    error: "Route not found",
+  });
 });
 
-// ---- start ----
-const PORT = process.env.PORT || 10000;
-app.listen(PORT, () => console.log(`Server running on port ${PORT}`));
+// ---------- Error Handler ----------
+app.use((err, req, res, next) => {
+  console.error("Server error:", err);
+  res.status(500).json({
+    ok: false,
+    error: "Internal server error",
+  });
+});
+
+// ---------- Start Server ----------
+const PORT = process.env.PORT || 3000;
+
+app.listen(PORT, () => {
+  console.log(`🚀 Server running on port ${PORT}`);
+  console.log("ADMIN_KEY set:", Boolean(process.env.ADMIN_KEY));
+});
