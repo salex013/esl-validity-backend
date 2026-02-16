@@ -1,13 +1,24 @@
 import express from "express";
 import cors from "cors";
 
+// --------------------
+// App + middleware
+// --------------------
 const app = express();
 
-// --- basics ---
-app.use(cors());
+app.use(
+  cors({
+    origin: "*", // you can lock this down later to your Netlify domain
+    methods: ["GET", "POST", "OPTIONS"],
+    allowedHeaders: ["Content-Type", "x-admin-key"],
+  })
+);
+
 app.use(express.json({ limit: "2mb" }));
 
-// --- admin auth (optional) ---
+// --------------------
+// Admin auth
+// --------------------
 function getAdminKeyFromRequest(req) {
   return (
     req.get("x-admin-key") ||
@@ -34,7 +45,6 @@ function requireAdmin(req, res, next) {
   }
 
   const provided = getAdminKeyFromRequest(req);
-
   if (!provided || provided !== expected) {
     return res.status(401).json({ ok: false, error: "Unauthorized" });
   }
@@ -42,130 +52,182 @@ function requireAdmin(req, res, next) {
   return next();
 }
 
-// --- helpers ---
-function cleanStr(x) {
-  return (x ?? "").toString().trim();
+// --------------------
+// Helpers
+// --------------------
+function mustHaveGroqKey() {
+  const key = (process.env.GROQ_API_KEY || "").toString().trim();
+  return key;
 }
 
-function basicRubricTable({ levelFramework, level, skill }) {
-  // Matches the SLATE-style columns you showed
-  return {
-    columns: [
-      "Criteria",
-      "Out of",
-      "Exceeds expectations (80%+)",
-      "Meets expectations (70–79%)",
-      "Needs some improvement (60–69%)",
-      "Did not achieve (59% or lower)",
-      "Criterion score",
-    ],
-    rows: [
-      {
-        criteria: "Task completion",
-        outOf: " / 5",
-        exceeds: "All required parts completed fully and appropriately.",
-        meets: "Most required parts completed; minor gaps.",
-        developing: "Some parts incomplete or unclear; important details missing.",
-        beginning: "Task mostly incomplete or does not meet requirements.",
-        score: "",
-      },
-      {
-        criteria: "Organization / coherence",
-        outOf: " / 5",
-        exceeds: "Very clear, logical flow; easy to follow.",
-        meets: "Generally clear; a few small organization issues.",
-        developing: "Some confusion; ideas not always connected clearly.",
-        beginning: "Hard to follow; organization prevents understanding.",
-        score: "",
-      },
-      {
-        criteria: "Language use (grammar & vocab)",
-        outOf: " / 5",
-        exceeds: `Strong control for ${levelFramework} ${level}; accurate range and word choice.`,
-        meets: `Appropriate for ${levelFramework} ${level}; some errors but meaning is clear.`,
-        developing: "Limited range; frequent errors that sometimes affect meaning.",
-        beginning: "Very limited control; errors often block meaning.",
-        score: "",
-      },
-      {
-        criteria: skill === "Speaking" ? "Fluency & pronunciation" : "Mechanics / clarity",
-        outOf: " / 5",
-        exceeds: "Smooth, clear, confident; very easy to understand.",
-        meets: "Mostly clear; a few issues do not interrupt understanding.",
-        developing: "Sometimes unclear; listener/reader must work to understand.",
-        beginning: "Often unclear; communication breaks down.",
-        score: "",
-      },
-    ],
-  };
+function safeText(v) {
+  return (v ?? "").toString().trim();
 }
 
-function basicInstructions({ levelFramework, level, skill, purpose, assessmentType, description, learningOutcomes }) {
-  const header = `Assessment Instructions (${levelFramework} ${level})`;
-  const bullets = [
-    "Read the task carefully.",
-    "Complete the task using language that matches your level.",
-    "Submit your work by the deadline (your teacher will confirm).",
-  ];
-
-  const include = [
-    skill === "Speaking" ? "Clear pronunciation and an appropriate pace" : "Clear writing that is easy to follow",
-    "A clear main idea and supporting details",
-    "Relevant vocabulary for the topic",
-  ];
-
-  return [
-    header,
-    "",
-    `Skill: ${skill}`,
-    `Assessment type: ${assessmentType}`,
-    `Purpose: ${purpose}`,
-    "",
-    "Task:",
-    description ? description : "(teacher will provide)",
-    "",
-    "Steps:",
-    ...bullets.map((b, i) => `${i + 1}) ${b}`),
-    "",
-    "What to include:",
-    ...include.map((x) => `• ${x}`),
-    "",
-    "Learning outcomes (teacher input):",
-    learningOutcomes ? learningOutcomes : "(none provided)",
-  ].join("\n");
+function escapeHtml(str) {
+  return safeText(str)
+    .replaceAll("&", "&amp;")
+    .replaceAll("<", "&lt;")
+    .replaceAll(">", "&gt;")
+    .replaceAll('"', "&quot;")
+    .replaceAll("'", "&#039;");
 }
 
-function basicValidityReportHtml({ instructions, rubric }) {
-  const issues = [];
+function buildStyledHtmlReport({ title, subtitle, sections }) {
+  const sectionHtml = (sections || [])
+    .map(
+      (s) => `
+      <section class="card">
+        <h2>${escapeHtml(s.heading)}</h2>
+        ${s.bodyHtml || ""}
+      </section>
+    `
+    )
+    .join("\n");
 
-  if (!instructions || instructions.length < 80) issues.push("Instructions are very short — students may not understand expectations.");
-  if (!rubric || rubric.length < 80) issues.push("Rubric text is very short — criteria and performance levels may be unclear.");
+  return `<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8" />
+<meta name="viewport" content="width=device-width,initial-scale=1" />
+<title>${escapeHtml(title || "Report")}</title>
+<style>
+  :root{
+    --ink:#1f2d3a;
+    --muted:#6b7280;
+    --cream:#fff7ed;
+    --blush:#fde2e4;
+    --border:rgba(31,45,58,.14);
+    --shadow:0 14px 40px rgba(31,45,58,.10);
+    --radius:16px;
+    --gold:#d4af37;
+    --bg: linear-gradient(180deg, var(--cream), var(--blush));
+  }
+  *{box-sizing:border-box}
+  body{
+    margin:0;
+    font-family: system-ui,-apple-system,Segoe UI,Roboto,Arial,sans-serif;
+    color:var(--ink);
+    background: var(--bg);
+    padding: 24px;
+  }
+  .wrap{max-width: 980px; margin:0 auto;}
+  header{
+    background: rgba(255,255,255,.92);
+    border: 1px solid var(--border);
+    border-radius: var(--radius);
+    box-shadow: var(--shadow);
+    padding: 18px 18px;
+    margin-bottom: 18px;
+  }
+  h1{margin:0; font-size: 26px; line-height:1.2}
+  .sub{margin-top: 6px; color: var(--muted)}
+  .grid{display:grid; gap: 14px}
+  .card{
+    background: rgba(255,255,255,.94);
+    border: 1px solid var(--border);
+    border-radius: var(--radius);
+    box-shadow: var(--shadow);
+    padding: 18px;
+  }
+  .card h2{margin:0 0 10px; font-size:18px}
+  .pill{
+    display:inline-block;
+    border:1px solid var(--border);
+    border-radius:999px;
+    padding:6px 10px;
+    font-size: 12px;
+    color: var(--muted);
+    background: rgba(255,255,255,.9);
+  }
+  .rubric{
+    width:100%;
+    border-collapse: collapse;
+    overflow:hidden;
+    border-radius: 12px;
+    border:1px solid var(--border);
+  }
+  .rubric th, .rubric td{
+    border:1px solid var(--border);
+    padding: 10px;
+    vertical-align: top;
+    font-size: 14px;
+  }
+  .rubric th{
+    background: rgba(212,175,55,.15);
+    text-align:left;
+  }
+  .muted{color: var(--muted)}
+  ul{margin: 8px 0 0 18px}
+  .k{
+    font-weight: 600;
+  }
+  .twoCol{
+    display:grid;
+    grid-template-columns: 1fr 1fr;
+    gap: 12px;
+  }
+  @media (max-width: 860px){
+    .twoCol{grid-template-columns: 1fr;}
+  }
+  .hr{height:1px;background:var(--border);margin:12px 0}
+</style>
+</head>
+<body>
+  <div class="wrap">
+    <header>
+      <h1>${escapeHtml(title || "Report")}</h1>
+      <div class="sub">${escapeHtml(subtitle || "")}</div>
+    </header>
 
-  // simple “washback” heuristics
-  if (instructions.toLowerCase().includes("grammar") && !instructions.toLowerCase().includes("meaning")) {
-    issues.push("Washback risk: focus may skew toward grammar accuracy over meaning/communication.");
+    <div class="grid">
+      ${sectionHtml}
+    </div>
+  </div>
+</body>
+</html>`;
+}
+
+// --------------------
+// GROQ call (OpenAI-compatible endpoint)
+// --------------------
+async function groqChat({ system, user, temperature = 0.4, max_tokens = 1800 }) {
+  const key = mustHaveGroqKey();
+  if (!key) {
+    throw new Error("GROQ_API_KEY is missing on the server.");
   }
 
-  const score = Math.max(1, 5 - issues.length); // quick, transparent heuristic
+  const resp = await fetch("https://api.groq.com/openai/v1/chat/completions", {
+    method: "POST",
+    headers: {
+      Authorization: `Bearer ${key}`,
+      "Content-Type": "application/json",
+    },
+    body: JSON.stringify({
+      model: "llama-3.3-70b-versatile",
+      temperature,
+      max_tokens,
+      messages: [
+        { role: "system", content: system },
+        { role: "user", content: user },
+      ],
+    }),
+  });
 
-  return `
-    <div>
-      <p><strong>Overall signal:</strong> <span style="padding:6px 10px;border:2px solid #d4af37;border-radius:999px;color:#d4af37;font-weight:800;">${score}/5</span></p>
-      <h3>Validity & washback notes</h3>
-      <ul>
-        ${issues.length ? issues.map(i => `<li>${i}</li>`).join("") : "<li>Looks solid based on the text provided.</li>"}
-      </ul>
-      <h3>Recommendations</h3>
-      <ul>
-        <li>Add clearer success criteria (“what good looks like”) in student-friendly language.</li>
-        <li>Ensure rubric criteria align directly to the learning outcomes (content validity).</li>
-        <li>Add positive, actionable descriptors to encourage good washback (strategy + communication).</li>
-      </ul>
-    </div>
-  `;
+  const data = await resp.json().catch(() => ({}));
+
+  if (!resp.ok) {
+    const msg = data?.error?.message || JSON.stringify(data);
+    throw new Error(`GROQ error (${resp.status}): ${msg}`);
+  }
+
+  const text = data?.choices?.[0]?.message?.content || "";
+  return text;
 }
 
-// --- routes ---
+// --------------------
+// Routes: health + admin
+// --------------------
 app.get("/", (req, res) => {
   res.json({
     ok: true,
@@ -188,87 +250,306 @@ app.get("/api/admin/ping", requireAdmin, (req, res) => {
   res.json({ ok: true, admin: true, timestamp: new Date().toISOString() });
 });
 
-// ✅ NEW: generate
+// --------------------
+// POST /api/generate
+// --------------------
 app.post("/api/generate", async (req, res) => {
   try {
-    const skill = cleanStr(req.body.skill) || "Speaking";
-    const levelFramework = cleanStr(req.body.levelFramework) || "CLB";
-    const level = cleanStr(req.body.level) || "5";
-    const purpose = cleanStr(req.body.purpose) || "Formative";
-    const assessmentType = cleanStr(req.body.assessmentType) || "Task";
-    const description = cleanStr(req.body.description);
-    const learningOutcomes = cleanStr(req.body.learningOutcomes);
+    const payload = req.body || {};
+    const skill = safeText(payload.skill);
+    const levelFramework = safeText(payload.levelFramework || "CLB");
+    const level = safeText(payload.level);
+    const purpose = safeText(payload.purpose || "Formative");
+    const assessmentType = safeText(payload.assessmentType);
+    const description = safeText(payload.description);
+    const learningOutcomes = safeText(payload.learningOutcomes);
 
-    const instructionsMarkdown = basicInstructions({
-      levelFramework, level, skill, purpose, assessmentType, description, learningOutcomes
+    if (!skill || !level || !assessmentType || !description) {
+      return res.status(400).json({
+        ok: false,
+        error:
+          "Missing required fields: skill, level, assessmentType, description (and ideally learningOutcomes).",
+      });
+    }
+
+    const system = `You are an expert ESL/EAP assessment designer and validity specialist.
+You write clear, professional, teacher-ready assessments.
+Output MUST be in JSON only (no markdown fences).
+The JSON keys MUST be:
+- instructions (string, student-facing)
+- rubric (object with: title, totalPoints (number), criteria (array of objects with: name, outOf (number), bands (array of 4 objects with: label, range, descriptor)))
+- teacherNotes (string)
+- improvementsChecklist (array of strings)
+Style: clean, Sheridan-style academic tone, practical, AODA-friendly formatting cues.`;
+
+    const user = `Create a complete assessment package from:
+Skill: ${skill}
+Framework: ${levelFramework}
+Level: ${level}
+Purpose: ${purpose}
+Assessment type: ${assessmentType}
+Task/Description: ${description}
+Learning outcomes: ${learningOutcomes || "(none provided)"}
+
+Rubric requirements:
+- 4 bands: Exceeds expectations / Meets expectations / Needs some improvement / Did not achieve
+- Include point ranges and descriptors
+- Criteria should match the skill and task (3–5 criteria)
+- Total points should be 20 (unless task clearly needs another total; prefer 20)
+
+Return valid JSON only.`;
+
+    const raw = await groqChat({ system, user, temperature: 0.35, max_tokens: 1800 });
+
+    let parsed;
+    try {
+      parsed = JSON.parse(raw);
+    } catch (e) {
+      // If model returns almost-json, try to salvage:
+      return res.status(502).json({
+        ok: false,
+        error: "Model returned non-JSON. (We can harden this if needed.)",
+        raw,
+      });
+    }
+
+    // Build a styled HTML document for download/print
+    const rubric = parsed.rubric || {};
+    const criteria = Array.isArray(rubric.criteria) ? rubric.criteria : [];
+
+    const rubricTable = `
+      <div class="muted pill">Rubric: ${escapeHtml(rubric.title || `${skill} Rubric`)}</div>
+      <div class="hr"></div>
+      <table class="rubric">
+        <thead>
+          <tr>
+            <th style="width:18%">Criteria</th>
+            <th style="width:10%">Out of</th>
+            <th>Exceeds expectations</th>
+            <th>Meets expectations</th>
+            <th>Needs some improvement</th>
+            <th>Did not achieve</th>
+          </tr>
+        </thead>
+        <tbody>
+          ${criteria
+            .map((c) => {
+              const bands = Array.isArray(c.bands) ? c.bands : [];
+              const b = (i) => bands[i] || {};
+              return `
+                <tr>
+                  <td><span class="k">${escapeHtml(c.name || "")}</span></td>
+                  <td>${escapeHtml(c.outOf)}</td>
+                  <td><div class="muted">${escapeHtml(b(0).range || "")}</div>${escapeHtml(b(0).descriptor || "")}</td>
+                  <td><div class="muted">${escapeHtml(b(1).range || "")}</div>${escapeHtml(b(1).descriptor || "")}</td>
+                  <td><div class="muted">${escapeHtml(b(2).range || "")}</div>${escapeHtml(b(2).descriptor || "")}</td>
+                  <td><div class="muted">${escapeHtml(b(3).range || "")}</div>${escapeHtml(b(3).descriptor || "")}</td>
+                </tr>
+              `;
+            })
+            .join("")}
+        </tbody>
+      </table>
+      <p class="muted" style="margin-top:10px">Total: ${escapeHtml(rubric.totalPoints ?? 20)} points</p>
+    `;
+
+    const instructionsHtml = `
+      <div class="twoCol">
+        <div>
+          <div class="pill"><span class="k">Skill:</span> ${escapeHtml(skill)}</div>
+          <div class="pill" style="margin-left:6px"><span class="k">Level:</span> ${escapeHtml(levelFramework)} ${escapeHtml(level)}</div>
+          <div class="pill" style="margin-left:6px"><span class="k">Purpose:</span> ${escapeHtml(purpose)}</div>
+        </div>
+        <div class="muted" style="text-align:right; padding-top:4px">
+          Teacher-ready package (print/save as PDF)
+        </div>
+      </div>
+      <div class="hr"></div>
+      <div style="white-space:pre-wrap">${escapeHtml(parsed.instructions || "")}</div>
+    `;
+
+    const teacherNotesHtml = `
+      <div style="white-space:pre-wrap">${escapeHtml(parsed.teacherNotes || "")}</div>
+      ${
+        Array.isArray(parsed.improvementsChecklist)
+          ? `<div class="hr"></div><div class="k">Quick quality checklist</div><ul>${parsed.improvementsChecklist
+              .map((x) => `<li>${escapeHtml(x)}</li>`)
+              .join("")}</ul>`
+          : ""
+      }
+    `;
+
+    const html = buildStyledHtmlReport({
+      title: "Assessment Package",
+      subtitle: `${skill} • ${levelFramework} ${level} • ${purpose} • ${assessmentType}`,
+      sections: [
+        { heading: "Student Instructions", bodyHtml: instructionsHtml },
+        { heading: "Rubric", bodyHtml: rubricTable },
+        { heading: "Teacher Notes", bodyHtml: teacherNotesHtml },
+      ],
     });
 
-    const rubricTable = basicRubricTable({ levelFramework, level, skill });
-
-    return res.json({
+    res.json({
       ok: true,
-      generated: { instructionsMarkdown, rubricTable },
+      data: parsed,        // structured JSON (for the frontend to render)
+      htmlReport: html,    // styled HTML (for download/print)
     });
   } catch (err) {
     console.error("Generate error:", err);
-    return res.status(500).json({ ok: false, error: "Generate failed." });
+    res.status(500).json({ ok: false, error: err.message || "Generation failed" });
   }
 });
 
-// ✅ NEW: analyze
+// --------------------
+// POST /api/analyze
+// --------------------
 app.post("/api/analyze", async (req, res) => {
   try {
-    const instructions = cleanStr(req.body.instructions);
-    const rubric = cleanStr(req.body.rubric);
-    const meta = req.body.meta || {};
+    const payload = req.body || {};
+    const assessmentText = safeText(payload.assessmentText);
+    const rubricText = safeText(payload.rubricText);
+    const meta = payload.meta || {};
+    const framework = safeText(meta.levelFramework || "CLB");
+    const level = safeText(meta.level || "");
+    const skill = safeText(meta.skill || "");
 
-    const reportHtml = basicValidityReportHtml({ instructions, rubric });
+    if (!assessmentText && !rubricText) {
+      return res.status(400).json({
+        ok: false,
+        error: "Provide assessmentText and/or rubricText to analyze.",
+      });
+    }
 
-    // “Improved” versions (simple starter version; you can upgrade with Groq later)
-    const improvedInstructionsText = instructions
-      ? instructions + "\n\n(Improvement) Add: time limit, submission format, and a model/example response."
-      : basicInstructions({
-          levelFramework: meta.levelFramework || "CLB",
-          level: meta.level || "5",
-          skill: meta.skill || "Speaking",
-          purpose: meta.purpose || "Formative",
-          assessmentType: meta.assessmentType || "Task",
-          description: meta.description || "",
-          learningOutcomes: meta.learningOutcomes || "",
-        });
+    const system = `You are a language assessment validity expert (ESL/EAP).
+You evaluate: construct alignment, content validity, reliability risks, fairness, accessibility, washback, authenticity, practicality.
+You MUST return JSON only with keys:
+- summary (string)
+- strengths (array of strings)
+- risks (array of strings)
+- washback (object with: positive (array), negative (array), suggestions (array))
+- alignment (object with: likelyConstruct (string), evidence (array of strings), gaps (array of strings))
+- improvedAssessment (string)
+- improvedRubric (string)
+- recommendations (array of strings)
+Keep it teacher-friendly and concrete.`;
 
-    const improvedRubricTable = basicRubricTable({
-      levelFramework: meta.levelFramework || "CLB",
-      level: meta.level || "5",
-      skill: meta.skill || "Speaking",
+    const user = `Analyze the following assessment materials.
+
+Context:
+Skill: ${skill || "(unknown)"}
+Framework: ${framework}
+Level: ${level || "(unknown)"}
+
+ASSESSMENT:
+${assessmentText || "(none)"}
+
+RUBRIC:
+${rubricText || "(none)"}
+
+Return JSON only.`;
+
+    const raw = await groqChat({ system, user, temperature: 0.25, max_tokens: 1800 });
+
+    let parsed;
+    try {
+      parsed = JSON.parse(raw);
+    } catch (e) {
+      return res.status(502).json({
+        ok: false,
+        error: "Model returned non-JSON. (We can harden this if needed.)",
+        raw,
+      });
+    }
+
+    const strengthsHtml = Array.isArray(parsed.strengths)
+      ? `<ul>${parsed.strengths.map((x) => `<li>${escapeHtml(x)}</li>`).join("")}</ul>`
+      : `<div class="muted">(none)</div>`;
+
+    const risksHtml = Array.isArray(parsed.risks)
+      ? `<ul>${parsed.risks.map((x) => `<li>${escapeHtml(x)}</li>`).join("")}</ul>`
+      : `<div class="muted">(none)</div>`;
+
+    const washback = parsed.washback || {};
+    const washbackHtml = `
+      <div class="twoCol">
+        <div>
+          <div class="k">Positive washback</div>
+          <ul>${(washback.positive || []).map((x) => `<li>${escapeHtml(x)}</li>`).join("")}</ul>
+        </div>
+        <div>
+          <div class="k">Negative washback risks</div>
+          <ul>${(washback.negative || []).map((x) => `<li>${escapeHtml(x)}</li>`).join("")}</ul>
+        </div>
+      </div>
+      <div class="hr"></div>
+      <div class="k">Washback improvement suggestions</div>
+      <ul>${(washback.suggestions || []).map((x) => `<li>${escapeHtml(x)}</li>`).join("")}</ul>
+    `;
+
+    const alignment = parsed.alignment || {};
+    const alignmentHtml = `
+      <div class="pill"><span class="k">Likely construct:</span> ${escapeHtml(alignment.likelyConstruct || "")}</div>
+      <div class="hr"></div>
+      <div class="k">Evidence</div>
+      <ul>${(alignment.evidence || []).map((x) => `<li>${escapeHtml(x)}</li>`).join("")}</ul>
+      <div class="k" style="margin-top:10px">Gaps</div>
+      <ul>${(alignment.gaps || []).map((x) => `<li>${escapeHtml(x)}</li>`).join("")}</ul>
+    `;
+
+    const improvedHtml = `
+      <div class="k">Improved assessment (clean version)</div>
+      <div class="hr"></div>
+      <div style="white-space:pre-wrap">${escapeHtml(parsed.improvedAssessment || "")}</div>
+      <div class="hr"></div>
+      <div class="k">Improved rubric (clean version)</div>
+      <div class="hr"></div>
+      <div style="white-space:pre-wrap">${escapeHtml(parsed.improvedRubric || "")}</div>
+    `;
+
+    const recHtml = Array.isArray(parsed.recommendations)
+      ? `<ul>${parsed.recommendations.map((x) => `<li>${escapeHtml(x)}</li>`).join("")}</ul>`
+      : `<div class="muted">(none)</div>`;
+
+    const html = buildStyledHtmlReport({
+      title: "Validity & Washback Report",
+      subtitle: `${skill || "Assessment"} • ${framework} ${level || ""}`.trim(),
+      sections: [
+        { heading: "Summary", bodyHtml: `<div style="white-space:pre-wrap">${escapeHtml(parsed.summary || "")}</div>` },
+        { heading: "Strengths", bodyHtml: strengthsHtml },
+        { heading: "Risks / Validity Threats", bodyHtml: risksHtml },
+        { heading: "Washback", bodyHtml: washbackHtml },
+        { heading: "Alignment", bodyHtml: alignmentHtml },
+        { heading: "Improved Versions", bodyHtml: improvedHtml },
+        { heading: "Recommendations", bodyHtml: recHtml },
+      ],
     });
 
-    return res.json({
+    res.json({
       ok: true,
-      reportHtml,
-      improved: {
-        instructionsText: improvedInstructionsText,
-        rubricTable: improvedRubricTable,
-      },
+      data: parsed,
+      htmlReport: html,
     });
   } catch (err) {
     console.error("Analyze error:", err);
-    return res.status(500).json({ ok: false, error: "Analyze failed." });
+    res.status(500).json({ ok: false, error: err.message || "Analysis failed" });
   }
 });
 
-// --- 404 catch ---
+// --------------------
+// 404 + error handlers
+// --------------------
 app.use((req, res) => {
   res.status(404).json({ ok: false, error: "Route not found" });
 });
 
-// --- error handler ---
 app.use((err, req, res, next) => {
   console.error("Server error:", err);
   res.status(500).json({ ok: false, error: "Internal server error" });
 });
 
-// --- start ---
+// --------------------
+// Start
+// --------------------
 const PORT = process.env.PORT || 3000;
 app.listen(PORT, () => {
   console.log(`🚀 Server running on port ${PORT}`);
