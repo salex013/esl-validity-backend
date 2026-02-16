@@ -2,6 +2,7 @@
   "name": "esl-validity-backend",
   "version": "1.0.0",
   "description": "ESL Validity Tool Backend (Render)",
+  "type": "module",
   "main": "src/server.js",
   "scripts": {
     "start": "node src/server.js"
