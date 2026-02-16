@@ -1,21 +1,23 @@
 // src/middleware/admin.js
+export function requireAdmin(req, res, next) {
+  const expected = process.env.ADMIN_KEY;
 
-module.exports = function admin(req, res, next) {
-  const provided =
-    (req.header("x-admin-key") || req.header("X-Admin-Key") || "").trim();
-
-  const expected = (process.env.ADMIN_KEY || "").trim();
-
+  // If you forgot to set it on Render, fail loudly (this is a server misconfig)
   if (!expected) {
     return res.status(500).json({
       ok: false,
-      error: "Admin key not configured (set ADMIN_KEY in environment)",
+      error: "ADMIN_KEY not configured on server",
     });
   }
 
-  if (!provided || provided !== expected) {
+  const got =
+    req.get("x-admin-key") ||
+    req.get("X-Admin-Key") ||
+    ""; // header names are case-insensitive, but this is extra-safe
+
+  if (got !== expected) {
     return res.status(401).json({ ok: false, error: "Unauthorized" });
   }
 
   next();
-};
+}
