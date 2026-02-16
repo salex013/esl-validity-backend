@@ -1,40 +1,45 @@
 // src/server.js
+import express from "express";
+import cors from "cors";
+import dotenv from "dotenv";
 
-require("dotenv").config();
+import { requireAdmin } from "./middleware/admin.js";
 
-const express = require("express");
-const cors = require("cors");
-
-const admin = require("./middleware/admin.js");
+dotenv.config();
 
 const app = express();
 
+// --- Middleware ---
 app.use(cors());
-app.use(express.json({ limit: "15mb" }));
+app.use(express.json({ limit: "2mb" }));
 
-// --- Health check (matches what you were seeing) ---
+// --- Health ---
 app.get("/api/health", (req, res) => {
   res.json({
     ok: true,
     name: "ESL Validity Tool Backend",
     timestamp: new Date().toISOString(),
-    groqConfigured: !!process.env.GROQ_API_KEY,
     adminConfigured: !!process.env.ADMIN_KEY,
+    groqConfigured: !!process.env.GROQ_API_KEY, // if you use Groq
   });
 });
 
-// --- Example protected endpoint (history) ---
-app.get("/api/history", admin, async (req, res) => {
-  // If your project stores history elsewhere, swap this section out.
-  // For now, return a safe placeholder so the route works.
+// --- Example admin-protected endpoint (adjust path to your real one) ---
+app.get("/api/history", requireAdmin, async (req, res) => {
+  // TODO: replace with your real history storage logic
+  // For now it returns an empty array so the route works.
   res.json({
     ok: true,
     items: [],
-    message:
-      "History endpoint is protected and working. Plug in your real storage here.",
   });
 });
 
+// --- 404 ---
+app.use((req, res) => {
+  res.status(404).json({ ok: false, error: "Not found" });
+});
+
+// --- Start ---
 const PORT = process.env.PORT || 10000;
 app.listen(PORT, () => {
   console.log(`Server running on port ${PORT}`);
