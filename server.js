@@ -3,74 +3,91 @@ import cors from "cors";
 
 const app = express();
 
+// --- basics ---
 app.use(cors());
-app.use(express.json({ limit: "3mb" }));
+app.use(express.json({ limit: "4mb" }));
 
-const PORT = process.env.PORT || 3000;
-const GROQ_KEY = (process.env.GROQ_API_KEY || "").trim();
-
-/* ------------------------------
-   Helpers
---------------------------------*/
-
-function ok(res, payload) {
-  res.json({ ok: true, ...payload });
-}
-function fail(res, code, message, details) {
-  res.status(code).json({ ok: false, error: message, details });
-}
-
-function requireGroq(res) {
-  if (!GROQ_KEY) {
-    fail(res, 500, "GROQ_API_KEY is not set on the server.");
-    return false;
-  }
-  return true;
-}
-
-/**
- * Extract the first valid JSON object from a string.
- * Handles models that wrap JSON in text/code fences.
- */
-function extractJsonObject(text) {
-  if (!text) return null;
-
-  // Strip code fences if present
-  const cleaned = text
-    .replace(/```json/gi, "```")
-    .replace(/```/g, "")
+// --- admin auth (header + env var) ---
+function getAdminKeyFromRequest(req) {
+  return (
+    req.get("x-admin-key") ||
+    req.get("X-Admin-Key") ||
+    req.headers["x-admin-key"] ||
+    ""
+  )
+    .toString()
     .trim();
+}
 
-  // Find first "{" and then try to parse a balanced object
-  const start = cleaned.indexOf("{");
-  if (start === -1) return null;
+function getExpectedAdminKey() {
+  return (process.env.ADMIN_KEY || "").toString().trim();
+}
 
-  let depth = 0;
-  for (let i = start; i < cleaned.length; i++) {
-    const ch = cleaned[i];
-    if (ch === "{") depth++;
-    if (ch === "}") depth--;
-    if (depth === 0) {
-      const candidate = cleaned.slice(start, i + 1);
-      try {
-        return JSON.parse(candidate);
-      } catch {
-        return null;
-      }
-    }
+function requireAdmin(req, res, next) {
+  const expected = getExpectedAdminKey();
+
+  if (!expected) {
+    return res.status(500).json({
+      ok: false,
+      error: "ADMIN_KEY is not set on the server (Render Environment).",
+    });
   }
+
+  const provided = getAdminKeyFromRequest(req);
+
+  if (!provided || provided !== expected) {
+    return res.status(401).json({ ok: false, error: "Unauthorized" });
+  }
+
+  return next();
+}
+
+// --- helpers ---
+function safeString(x) {
+  if (x === null || x === undefined) return "";
+  return String(x);
+}
+
+function extractJSON(text) {
+  // If model returns fenced JSON, try to extract it
+  const t = safeString(text).trim();
+
+  // Try direct parse first
+  try {
+    return JSON.parse(t);
+  } catch {}
+
+  // Try ```json ... ```
+  const fenced = t.match(/```json\s*([\s\S]*?)\s*```/i) || t.match(/```\s*([\s\S]*?)\s*```/);
+  if (fenced && fenced[1]) {
+    try {
+      return JSON.parse(fenced[1].trim());
+    } catch {}
+  }
+
+  // Try first {...} block
+  const obj = t.match(/\{[\s\S]*\}/);
+  if (obj) {
+    try {
+      return JSON.parse(obj[0]);
+    } catch {}
+  }
+
   return null;
 }
 
-async function callGroqJson({ system, user, temperature = 0.2 }) {
+async function groqChat({ system, user, temperature = 0.2 }) {
+  const apiKey = (process.env.GROQ_API_KEY || "").toString().trim();
+  if (!apiKey) throw new Error("GROQ_API_KEY is not set on the server (Render Environment).");
+
   const resp = await fetch("https://api.groq.com/openai/v1/chat/completions", {
     method: "POST",
     headers: {
-      "Content-Type": "application/json",
-      Authorization: `Bearer ${GROQ_KEY}`,
+      "content-type": "application/json",
+      authorization: `Bearer ${apiKey}`,
     },
     body: JSON.stringify({
-      model: "mixtral-8x7b-32768",
+      model: "llama-3.1-70b-versatile",
       temperature,
       messages: [
         { role: "system", content: system },
@@ -79,293 +96,211 @@ async function callGroqJson({ system, user, temperature = 0.2 }) {
     }),
   });
 
-  const data = await resp.json();
-
   if (!resp.ok) {
-    throw new Error(
-      data?.error?.message || `Groq error: ${resp.status} ${resp.statusText}`
-    );
+    const errText = await resp.text().catch(() => "");
+    throw new Error(`Groq API error ${resp.status}: ${errText || resp.statusText}`);
   }
 
-  const text = data?.choices?.[0]?.message?.content || "";
-  const json = extractJsonObject(text);
-
-  return { raw: text, json };
+  const data = await resp.json();
+  const content = data?.choices?.[0]?.message?.content ?? "";
+  return safeString(content);
 }
 
-/* ------------------------------
-   JSON Schemas (what we force the model to return)
---------------------------------*/
-
-const SYSTEM_JSON_ONLY = `
-You are an expert ESL assessment designer and language testing specialist.
-You must return ONLY valid JSON.
-No markdown. No explanations. No code fences.
-All strings must be properly escaped.
-If something is unknown, return an empty string.
-`;
-
-// Shared rubric table shape (renderable like SLATE)
-const RUBRIC_TABLE_SHAPE = `
-Rubric table format:
-rubric = {
-  "title": string,
-  "columns": [
-    {"key":"exceeds","label":"Exceeds expectations (80%+)"}, 
-    {"key":"meets","label":"Meets expectations (70–79%)"},
-    {"key":"developing","label":"Needs some improvement (60–69%)"},
-    {"key":"notyet","label":"Did not achieve (59% or lower)"}
-  ],
-  "rows": [
-    {
-      "criterion": string,
-      "outOf": string, 
-      "descriptors": {
-        "exceeds": string,
-        "meets": string,
-        "developing": string,
-        "notyet": string
-      }
-    }
-  ]
-}
-`;
-
-// Validity scan report shape
-const ANALYZE_SCHEMA = `
-Return JSON with this exact top-level structure:
-{
-  "meta": {
-    "framework": string,
-    "level": string,
-    "skill": string,
-    "purpose": string
-  },
-  "scores": {
-    "alignment": {"rating": number, "notes": string},
-    "constructValidity": {"rating": number, "notes": string},
-    "contentValidity": {"rating": number, "notes": string},
-    "fairnessAccessibility": {"rating": number, "notes": string},
-    "washback": {"rating": number, "notes": string},
-    "practicality": {"rating": number, "notes": string},
-    "reliabilityProxy": {"rating": number, "notes": string}
-  },
-  "issues": [
-    {"category": string, "severity": "low"|"medium"|"high", "evidence": string, "fix": string}
-  ],
-  "recommendations": [
-    {"priority": 1|2|3, "action": string, "rationale": string}
-  ],
-  "improved": {
-    "instructions": {
-      "title": string,
-      "studentFacing": string,
-      "teacherNotes": string
-    },
-    "rubric": <rubric table object>
-  },
-  "report": {
-    "summary": string,
-    "detailed": string
-  }
-}
-Also include the rubric table object exactly as described below:
-${RUBRIC_TABLE_SHAPE}
-`;
-
-// Build-new schema
-const GENERATE_SCHEMA = `
-Return JSON with this exact top-level structure:
-{
-  "meta": {
-    "framework": string,
-    "level": string,
-    "skill": string,
-    "purpose": string,
-    "assessmentType": string
-  },
-  "package": {
-    "instructions": {
-      "title": string,
-      "studentFacing": string,
-      "teacherNotes": string
-    },
-    "rubric": <rubric table object>,
-    "validityRationale": {
-      "alignment": string,
-      "construct": string,
-      "washback": string,
-      "fairnessAccessibility": string,
-      "practicality": string,
-      "reliabilityProxy": string
-    }
-  }
-}
-Also include the rubric table object exactly as described below:
-${RUBRIC_TABLE_SHAPE}
-`;
-
-/* ------------------------------
-   Routes
---------------------------------*/
-
+// --- routes ---
 app.get("/", (req, res) => {
-  ok(res, {
+  res.json({
+    ok: true,
     name: "ESL Validity Tool Backend",
     timestamp: new Date().toISOString(),
-    groqConfigured: Boolean(GROQ_KEY),
+    adminConfigured: Boolean(getExpectedAdminKey()),
+    groqConfigured: Boolean(process.env.GROQ_API_KEY),
   });
 });
 
 app.get("/api/health", (req, res) => {
-  ok(res, { groqConfigured: Boolean(GROQ_KEY) });
+  res.json({
+    ok: true,
+    adminConfigured: Boolean(getExpectedAdminKey()),
+    groqConfigured: Boolean(process.env.GROQ_API_KEY),
+  });
 });
 
-app.get("/api/routes", (req, res) => {
-  // Quick way to “see what handlers exist”
+app.get("/api/admin/ping", requireAdmin, (req, res) => {
+  res.json({ ok: true, admin: true, timestamp: new Date().toISOString() });
+});
+
+// Helpful: list available routes (admin only)
+app.get("/api/routes", requireAdmin, (req, res) => {
   const routes = [];
-  app._router.stack.forEach((m) => {
-    if (m.route) {
-      const methods = Object.keys(m.route.methods).map((x) => x.toUpperCase());
-      routes.push({ path: m.route.path, methods });
+  app._router?.stack?.forEach((layer) => {
+    if (layer?.route?.path) {
+      const methods = Object.keys(layer.route.methods || {})
+        .filter((m) => layer.route.methods[m])
+        .map((m) => m.toUpperCase());
+      routes.push({ path: layer.route.path, methods });
     }
   });
-  ok(res, { routes });
+  res.json({ ok: true, routes });
 });
 
-/**
- * Build NEW package (your "Build" mode)
- * Expects:
- * {
- *   "meta": { skill, levelFramework, level, purpose, assessmentType, description, learningOutcomes }
- * }
- */
-app.post("/api/generate", async (req, res) => {
+// POST /api/analyze (admin protected)
+app.post("/api/analyze", requireAdmin, async (req, res) => {
   try {
-    if (!requireGroq(res)) return;
-
-    const meta = req.body?.meta || {};
     const {
-      skill = "",
-      levelFramework = "",
+      framework = "CLB",
       level = "",
+      skill = "",
+      purpose = "",
+      assessmentText = "",
+      rubricText = "",
+    } = req.body || {};
+
+    if (!safeString(assessmentText).trim() && !safeString(rubricText).trim()) {
+      return res.status(400).json({
+        ok: false,
+        error: "Provide assessmentText and/or rubricText to analyze.",
+      });
+    }
+
+    const system = `
+You are an assessment and language testing specialist (ESL/EAP).
+Return STRICT JSON only. No markdown, no extra text.
+Your job: evaluate validity, reliability, fairness, authenticity, practicality, washback.
+Then propose concrete improvements and provide improved versions (clean and professional).
+
+JSON schema:
+{
+  "summary": string,
+  "scores": {
+    "validity": number (0-5),
+    "reliability": number (0-5),
+    "fairness": number (0-5),
+    "authenticity": number (0-5),
+    "practicality": number (0-5),
+    "washback": number (0-5)
+  },
+  "issues": [{ "area": string, "problem": string, "why_it_matters": string }],
+  "quick_fixes": [string],
+  "improved_assessment": string,
+  "improved_rubric": string
+}
+`;
+
+    const user = `
+Context:
+- Framework: ${framework}
+- Level: ${level}
+- Skill: ${skill}
+- Purpose: ${purpose}
+
+Assessment text:
+${safeString(assessmentText)}
+
+Rubric text:
+${safeString(rubricText)}
+`;
+
+    const out = await groqChat({ system, user, temperature: 0.2 });
+    const json = extractJSON(out);
+
+    if (!json) {
+      return res.status(500).json({
+        ok: false,
+        error: "Model did not return valid JSON.",
+        raw: out.slice(0, 2000),
+      });
+    }
+
+    return res.json({ ok: true, result: json });
+  } catch (e) {
+    console.error(e);
+    return res.status(500).json({ ok: false, error: String(e?.message || e) });
+  }
+});
+
+// POST /api/generate (admin protected)
+app.post("/api/generate", requireAdmin, async (req, res) => {
+  try {
+    const {
+      framework = "CLB",
+      level = "",
+      skill = "",
       purpose = "",
       assessmentType = "",
       description = "",
       learningOutcomes = "",
-    } = meta;
+    } = req.body || {};
 
-    const user = `
-Create a professional ESL assessment package.
-
-Context:
-- Skill: ${skill}
-- Framework: ${levelFramework}
-- Level: ${level}
-- Purpose: ${purpose}
-- Assessment type: ${assessmentType}
-
-Task prompt / description:
-${description}
-
-Learning outcomes:
-${learningOutcomes}
-
-Requirements:
-- Instructions must be student-facing, clear, and formatted with headings + bullets.
-- Rubric must be a table with 4 performance bands.
-- Criteria must match the skill and be observable.
-- Include teacher notes (admin / scoring guidance).
-- Add validity rationale text (alignment, construct, washback, fairness, practicality, reliability proxy).
-
-${GENERATE_SCHEMA}
-`;
-
-    const { raw, json } = await callGroqJson({
-      system: SYSTEM_JSON_ONLY,
-      user,
-      temperature: 0.2,
-    });
-
-    if (!json) {
-      return fail(res, 502, "Model did not return valid JSON.", { raw });
+    if (!safeString(skill).trim() || !safeString(level).trim()) {
+      return res.status(400).json({ ok: false, error: "Provide at least skill and level." });
     }
 
-    ok(res, { data: json });
-  } catch (err) {
-    fail(res, 500, "Server error in /api/generate", { message: err.message });
+    const system = `
+You are an ESL/EAP assessment designer.
+Return STRICT JSON only. No markdown.
+Generate: (1) student-facing instructions, (2) teacher notes, (3) a professional rubric formatted for easy copy/paste into a table.
+
+JSON schema:
+{
+  "title": string,
+  "student_instructions": string,
+  "teacher_notes": string,
+  "rubric_table": {
+    "columns": [string],
+    "rows": [
+      { "criterion": string, "descriptors": [string] }
+    ]
+  }
+}
+`;
+
+    const user = `
+Build an assessment package.
+
+Framework: ${framework}
+Level: ${level}
+Skill: ${skill}
+Purpose: ${purpose}
+Assessment type: ${assessmentType}
+Description/prompt: ${description}
+Learning outcomes: ${learningOutcomes}
+
+Rubric should use clear performance bands and descriptors aligned to the framework/level.
+`;
+
+    const out = await groqChat({ system, user, temperature: 0.35 });
+    const json = extractJSON(out);
+
+    if (!json) {
+      return res.status(500).json({
+        ok: false,
+        error: "Model did not return valid JSON.",
+        raw: out.slice(0, 2000),
+      });
+    }
+
+    return res.json({ ok: true, result: json });
+  } catch (e) {
+    console.error(e);
+    return res.status(500).json({ ok: false, error: String(e?.message || e) });
   }
 });
 
-/**
- * Scan + improve EXISTING assessment (your "Scan" mode)
- * Expects:
- * {
- *   "meta": { framework, level, skill, purpose },
- *   "instructions": "text...",
- *   "rubric": "text..."
- * }
- */
-app.post("/api/analyze", async (req, res) => {
-  try {
-    if (!requireGroq(res)) return;
-
-    const meta = req.body?.meta || {};
-    const instructions = (req.body?.instructions || "").toString();
-    const rubric = (req.body?.rubric || "").toString();
-
-    const framework = meta.framework || meta.levelFramework || "";
-    const level = meta.level || "";
-    const skill = meta.skill || "";
-    const purpose = meta.purpose || "";
-
-    const user = `
-Analyze and improve the following ESL assessment materials.
-
-Context:
-- Skill: ${skill}
-- Framework: ${framework}
-- Level: ${level}
-- Purpose: ${purpose}
-
-EXISTING INSTRUCTIONS:
-${instructions}
-
-EXISTING RUBRIC:
-${rubric}
-
-Tasks:
-1) Score and explain: alignment, construct validity, content validity, fairness/accessibility, washback, practicality, reliability proxy.
-2) Identify concrete issues with evidence and fixes.
-3) Produce improved versions:
-   - Professional student instructions (clean headings and bullets)
-   - Professional rubric as a table (4 bands, observable descriptors)
-
-${ANALYZE_SCHEMA}
-`;
-
-    const { raw, json } = await callGroqJson({
-      system: SYSTEM_JSON_ONLY,
-      user,
-      temperature: 0.2,
-    });
-
-    if (!json) {
-      return fail(res, 502, "Model did not return valid JSON.", { raw });
-    }
-
-    ok(res, { data: json });
-  } catch (err) {
-    fail(res, 500, "Server error in /api/analyze", { message: err.message });
-  }
-});
-
-// 404
+// --- 404 catch ---
 app.use((req, res) => {
-  fail(res, 404, "Route not found");
+  res.status(404).json({ ok: false, error: "Route not found" });
 });
 
+// --- error handler ---
+app.use((err, req, res, next) => {
+  console.error("Server error:", err);
+  res.status(500).json({ ok: false, error: "Internal server error" });
+});
+
+// --- start ---
+const PORT = process.env.PORT || 3000;
 app.listen(PORT, () => {
   console.log(`🚀 Server running on port ${PORT}`);
-  console.log("GROQ_API_KEY set:", Boolean(GROQ_KEY));
+  console.log("ADMIN_KEY set:", Boolean(process.env.ADMIN_KEY));
+  console.log("GROQ_API_KEY set:", Boolean(process.env.GROQ_API_KEY));
 });
