@@ -3,425 +3,369 @@ import cors from "cors";
 
 const app = express();
 
-// -------------------- basics --------------------
-app.use(cors()); // you can lock this down later to your Netlify domain
-app.use(express.json({ limit: "4mb" }));
+app.use(cors());
+app.use(express.json({ limit: "3mb" }));
 
-// -------------------- admin auth (header + env var) --------------------
-function getAdminKeyFromRequest(req) {
-  return (
-    req.get("x-admin-key") ||
-    req.get("X-Admin-Key") ||
-    req.headers["x-admin-key"] ||
-    ""
-  )
-    .toString()
+const PORT = process.env.PORT || 3000;
+const GROQ_KEY = (process.env.GROQ_API_KEY || "").trim();
+
+/* ------------------------------
+   Helpers
+--------------------------------*/
+
+function ok(res, payload) {
+  res.json({ ok: true, ...payload });
+}
+function fail(res, code, message, details) {
+  res.status(code).json({ ok: false, error: message, details });
+}
+
+function requireGroq(res) {
+  if (!GROQ_KEY) {
+    fail(res, 500, "GROQ_API_KEY is not set on the server.");
+    return false;
+  }
+  return true;
+}
+
+/**
+ * Extract the first valid JSON object from a string.
+ * Handles models that wrap JSON in text/code fences.
+ */
+function extractJsonObject(text) {
+  if (!text) return null;
+
+  // Strip code fences if present
+  const cleaned = text
+    .replace(/```json/gi, "```")
+    .replace(/```/g, "")
     .trim();
-}
 
-function getExpectedAdminKey() {
-  return (process.env.ADMIN_KEY || "").toString().trim();
-}
+  // Find first "{" and then try to parse a balanced object
+  const start = cleaned.indexOf("{");
+  if (start === -1) return null;
 
-function requireAdmin(req, res, next) {
-  const expected = getExpectedAdminKey();
-  if (!expected) {
-    return res.status(500).json({
-      ok: false,
-      error: "ADMIN_KEY is not set on the server (Render Environment).",
-    });
+  let depth = 0;
+  for (let i = start; i < cleaned.length; i++) {
+    const ch = cleaned[i];
+    if (ch === "{") depth++;
+    if (ch === "}") depth--;
+    if (depth === 0) {
+      const candidate = cleaned.slice(start, i + 1);
+      try {
+        return JSON.parse(candidate);
+      } catch {
+        return null;
+      }
+    }
   }
-
-  const provided = getAdminKeyFromRequest(req);
-  if (!provided || provided !== expected) {
-    return res.status(401).json({ ok: false, error: "Unauthorized" });
-  }
-  return next();
+  return null;
 }
 
-// -------------------- GROQ helper --------------------
-function requireGroq(req, res, next) {
-  if (!process.env.GROQ_API_KEY) {
-    return res.status(500).json({
-      ok: false,
-      error: "GROQ_API_KEY is not set on the server (Render Environment).",
-    });
-  }
-  return next();
-}
-
-async function groqChat({ system, user, temperature = 0.2, max_tokens = 2200 }) {
+async function callGroqJson({ system, user, temperature = 0.2 }) {
   const resp = await fetch("https://api.groq.com/openai/v1/chat/completions", {
     method: "POST",
     headers: {
-      Authorization: `Bearer ${process.env.GROQ_API_KEY}`,
       "Content-Type": "application/json",
+      Authorization: `Bearer ${GROQ_KEY}`,
     },
     body: JSON.stringify({
-      model: process.env.GROQ_MODEL || "llama-3.1-70b-versatile",
+      model: "mixtral-8x7b-32768",
       temperature,
-      max_tokens,
       messages: [
-        system ? { role: "system", content: system } : null,
+        { role: "system", content: system },
         { role: "user", content: user },
-      ].filter(Boolean),
+      ],
     }),
   });
 
-  if (!resp.ok) {
-    const txt = await resp.text();
-    throw new Error(`Groq error ${resp.status}: ${txt}`);
-  }
-
   const data = await resp.json();
-  return data?.choices?.[0]?.message?.content ?? "";
+
+  if (!resp.ok) {
+    throw new Error(
+      data?.error?.message || `Groq error: ${resp.status} ${resp.statusText}`
+    );
+  }
+
+  const text = data?.choices?.[0]?.message?.content || "";
+  const json = extractJsonObject(text);
+
+  return { raw: text, json };
 }
 
-// -------------------- small utilities --------------------
-function escapeHtml(str) {
-  return (str ?? "")
-    .toString()
-    .replaceAll("&", "&amp;")
-    .replaceAll("<", "&lt;")
-    .replaceAll(">", "&gt;")
-    .replaceAll('"', "&quot;")
-    .replaceAll("'", "&#039;");
-}
+/* ------------------------------
+   JSON Schemas (what we force the model to return)
+--------------------------------*/
 
-function nl2br(str) {
-  return escapeHtml(str).replaceAll("\n", "<br>");
-}
+const SYSTEM_JSON_ONLY = `
+You are an expert ESL assessment designer and language testing specialist.
+You must return ONLY valid JSON.
+No markdown. No explanations. No code fences.
+All strings must be properly escaped.
+If something is unknown, return an empty string.
+`;
 
-function safeJsonParse(maybeJson) {
-  try {
-    return JSON.parse(maybeJson);
-  } catch {
-    return null;
+// Shared rubric table shape (renderable like SLATE)
+const RUBRIC_TABLE_SHAPE = `
+Rubric table format:
+rubric = {
+  "title": string,
+  "columns": [
+    {"key":"exceeds","label":"Exceeds expectations (80%+)"}, 
+    {"key":"meets","label":"Meets expectations (70–79%)"},
+    {"key":"developing","label":"Needs some improvement (60–69%)"},
+    {"key":"notyet","label":"Did not achieve (59% or lower)"}
+  ],
+  "rows": [
+    {
+      "criterion": string,
+      "outOf": string, 
+      "descriptors": {
+        "exceeds": string,
+        "meets": string,
+        "developing": string,
+        "notyet": string
+      }
+    }
+  ]
+}
+`;
+
+// Validity scan report shape
+const ANALYZE_SCHEMA = `
+Return JSON with this exact top-level structure:
+{
+  "meta": {
+    "framework": string,
+    "level": string,
+    "skill": string,
+    "purpose": string
+  },
+  "scores": {
+    "alignment": {"rating": number, "notes": string},
+    "constructValidity": {"rating": number, "notes": string},
+    "contentValidity": {"rating": number, "notes": string},
+    "fairnessAccessibility": {"rating": number, "notes": string},
+    "washback": {"rating": number, "notes": string},
+    "practicality": {"rating": number, "notes": string},
+    "reliabilityProxy": {"rating": number, "notes": string}
+  },
+  "issues": [
+    {"category": string, "severity": "low"|"medium"|"high", "evidence": string, "fix": string}
+  ],
+  "recommendations": [
+    {"priority": 1|2|3, "action": string, "rationale": string}
+  ],
+  "improved": {
+    "instructions": {
+      "title": string,
+      "studentFacing": string,
+      "teacherNotes": string
+    },
+    "rubric": <rubric table object>
+  },
+  "report": {
+    "summary": string,
+    "detailed": string
   }
 }
+Also include the rubric table object exactly as described below:
+${RUBRIC_TABLE_SHAPE}
+`;
 
-function buildRubricTableHTML(rubric) {
-  // rubric format:
-  // { title, criteria: [{name, outOf, levels:[{label, range, desc}...]}] }
-  const title = rubric?.title ? escapeHtml(rubric.title) : "Rubric";
-  const criteria = Array.isArray(rubric?.criteria) ? rubric.criteria : [];
-
-  // Find max levels so columns align
-  let maxLevels = 0;
-  for (const c of criteria) maxLevels = Math.max(maxLevels, (c.levels || []).length);
-
-  const headerCells = [
-    `<th>Criteria</th>`,
-    `<th>Out of</th>`,
-    ...Array.from({ length: maxLevels }, (_, i) => `<th>Level ${i + 1}</th>`),
-    `<th>Criterion Score</th>`,
-  ].join("");
-
-  const rows = criteria
-    .map((c) => {
-      const name = escapeHtml(c.name || "");
-      const outOf = escapeHtml(c.outOf || "");
-      const levels = Array.isArray(c.levels) ? c.levels : [];
-
-      const levelTds = Array.from({ length: maxLevels }, (_, i) => {
-        const L = levels[i];
-        if (!L) return `<td></td>`;
-        const label = escapeHtml(L.label || "");
-        const range = escapeHtml(L.range || "");
-        const desc = escapeHtml(L.desc || "");
-        return `<td><div class="lvl">
-          <div class="lvl-top"><strong>${label}</strong>${range ? ` <span class="range">(${range})</span>` : ""}</div>
-          <div class="lvl-desc">${desc}</div>
-        </div></td>`;
-      }).join("");
-
-      return `<tr>
-        <td><strong>${name}</strong></td>
-        <td>${outOf}</td>
-        ${levelTds}
-        <td class="scorebox">/ ${outOf || ""}</td>
-      </tr>`;
-    })
-    .join("");
-
-  return `
-    <div class="rubric-wrap">
-      <h2 class="rubric-title">${title}</h2>
-      <div class="rubric-table-wrap">
-        <table class="rubric-table">
-          <thead><tr>${headerCells}</tr></thead>
-          <tbody>${rows}</tbody>
-        </table>
-      </div>
-    </div>
-  `;
+// Build-new schema
+const GENERATE_SCHEMA = `
+Return JSON with this exact top-level structure:
+{
+  "meta": {
+    "framework": string,
+    "level": string,
+    "skill": string,
+    "purpose": string,
+    "assessmentType": string
+  },
+  "package": {
+    "instructions": {
+      "title": string,
+      "studentFacing": string,
+      "teacherNotes": string
+    },
+    "rubric": <rubric table object>,
+    "validityRationale": {
+      "alignment": string,
+      "construct": string,
+      "washback": string,
+      "fairnessAccessibility": string,
+      "practicality": string,
+      "reliabilityProxy": string
+    }
+  }
 }
+Also include the rubric table object exactly as described below:
+${RUBRIC_TABLE_SHAPE}
+`;
 
-function buildInstructionsHTML(meta, instructionsText) {
-  const skill = escapeHtml(meta?.skill || "");
-  const framework = escapeHtml(meta?.framework || "");
-  const level = escapeHtml(meta?.level || "");
-  const purpose = escapeHtml(meta?.purpose || "");
-  const assessmentType = escapeHtml(meta?.assessmentType || "");
-  const title = `${skill} Assessment Instructions${level ? ` (${framework} ${level})` : ""}`;
+/* ------------------------------
+   Routes
+--------------------------------*/
 
-  return `
-    <div class="instructions-wrap">
-      <h2 class="ins-title">${title}</h2>
-      <div class="ins-meta">
-        <div><strong>Skill:</strong> ${skill}</div>
-        <div><strong>Framework:</strong> ${framework}</div संकेत
-        <div><strong>Level:</strong> ${level}</div>
-        <div><strong>Purpose:</strong> ${purpose}</div>
-        <div><strong>Assessment type:</strong> ${assessmentType}</div>
-      </div>
-      <div class="ins-body">${nl2br(instructionsText)}</div>
-    </div>
-  `;
-}
-
-// -------------------- core routes --------------------
 app.get("/", (req, res) => {
-  res.json({
-    ok: true,
+  ok(res, {
     name: "ESL Validity Tool Backend",
     timestamp: new Date().toISOString(),
-    adminConfigured: Boolean(getExpectedAdminKey()),
-    groqConfigured: Boolean(process.env.GROQ_API_KEY),
+    groqConfigured: Boolean(GROQ_KEY),
   });
 });
 
 app.get("/api/health", (req, res) => {
-  res.json({
-    ok: true,
-    adminConfigured: Boolean(getExpectedAdminKey()),
-    groqConfigured: Boolean(process.env.GROQ_API_KEY),
-  });
+  ok(res, { groqConfigured: Boolean(GROQ_KEY) });
 });
 
-// ✅ This answers your question: "how do I find what my backend handlers are called?"
 app.get("/api/routes", (req, res) => {
+  // Quick way to “see what handlers exist”
   const routes = [];
-  app._router?.stack?.forEach((layer) => {
-    if (layer?.route?.path) {
-      const methods = Object.keys(layer.route.methods).map((m) => m.toUpperCase());
-      routes.push({ path: layer.route.path, methods });
+  app._router.stack.forEach((m) => {
+    if (m.route) {
+      const methods = Object.keys(m.route.methods).map((x) => x.toUpperCase());
+      routes.push({ path: m.route.path, methods });
     }
   });
-  res.json({ ok: true, routes });
+  ok(res, { routes });
 });
 
-app.get("/api/admin/ping", requireAdmin, (req, res) => {
-  res.json({ ok: true, admin: true, timestamp: new Date().toISOString() });
-});
-
-// -------------------- AI: GENERATE (instructions + rubric) --------------------
-app.post("/api/generate", requireGroq, async (req, res) => {
+/**
+ * Build NEW package (your "Build" mode)
+ * Expects:
+ * {
+ *   "meta": { skill, levelFramework, level, purpose, assessmentType, description, learningOutcomes }
+ * }
+ */
+app.post("/api/generate", async (req, res) => {
   try {
-    const meta = req.body?.meta || {};
-    const prompt = req.body?.prompt || meta?.description || "";
+    if (!requireGroq(res)) return;
 
-    const system = `
-You are an expert ESL/EAP assessment designer.
-Return ONLY valid JSON.
-Your job:
-1) Write clear student-facing assessment instructions (AODA-friendly, simple layout).
-2) Create a professional rubric in a structured format suitable for a D2L-style table.
-Rubric must include criteria, "outOf", and 4 performance levels with labels + %/score ranges + descriptors.
-Do NOT include markdown fences. JSON only.
-`;
+    const meta = req.body?.meta || {};
+    const {
+      skill = "",
+      levelFramework = "",
+      level = "",
+      purpose = "",
+      assessmentType = "",
+      description = "",
+      learningOutcomes = "",
+    } = meta;
 
     const user = `
-META:
-- skill: ${meta.skill || ""}
-- framework: ${meta.framework || ""}
-- level: ${meta.level || ""}
-- purpose: ${meta.purpose || ""}
-- assessmentType: ${meta.assessmentType || ""}
-- learningOutcomes: ${meta.learningOutcomes || ""}
+Create a professional ESL assessment package.
 
-TASK PROMPT / DESCRIPTION:
-${prompt}
+Context:
+- Skill: ${skill}
+- Framework: ${levelFramework}
+- Level: ${level}
+- Purpose: ${purpose}
+- Assessment type: ${assessmentType}
 
-Return JSON with this shape:
-{
-  "instructionsText": "....",
-  "rubric": {
-    "title": "...",
-    "criteria": [
-      {
-        "name": "...",
-        "outOf": "20 points",
-        "levels": [
-          {"label":"Exceeds expectations", "range":"80%+", "desc":"..."},
-          {"label":"Meets expectations", "range":"70–79%", "desc":"..."},
-          {"label":"Needs some improvement", "range":"60–69%", "desc":"..."},
-          {"label":"Did not achieve", "range":"59% or lower", "desc":"..."}
-        ]
-      }
-    ]
-  }
-}
+Task prompt / description:
+${description}
+
+Learning outcomes:
+${learningOutcomes}
+
+Requirements:
+- Instructions must be student-facing, clear, and formatted with headings + bullets.
+- Rubric must be a table with 4 performance bands.
+- Criteria must match the skill and be observable.
+- Include teacher notes (admin / scoring guidance).
+- Add validity rationale text (alignment, construct, washback, fairness, practicality, reliability proxy).
+
+${GENERATE_SCHEMA}
 `;
 
-    const raw = await groqChat({ system, user, temperature: 0.2, max_tokens: 2200 });
+    const { raw, json } = await callGroqJson({
+      system: SYSTEM_JSON_ONLY,
+      user,
+      temperature: 0.2,
+    });
 
-    // Sometimes models include extra text — try to extract JSON
-    const jsonStart = raw.indexOf("{");
-    const jsonEnd = raw.lastIndexOf("}");
-    const slice = jsonStart >= 0 && jsonEnd >= 0 ? raw.slice(jsonStart, jsonEnd + 1) : raw;
-    const parsed = safeJsonParse(slice);
-
-    if (!parsed?.instructionsText || !parsed?.rubric) {
-      return res.status(502).json({
-        ok: false,
-        error: "Model did not return valid JSON. Try again.",
-        raw,
-      });
+    if (!json) {
+      return fail(res, 502, "Model did not return valid JSON.", { raw });
     }
 
-    const instructionsHtml = buildInstructionsHTML(meta, parsed.instructionsText);
-    const rubricHtml = buildRubricTableHTML(parsed.rubric);
-
-    res.json({
-      ok: true,
-      meta,
-      instructionsText: parsed.instructionsText,
-      rubric: parsed.rubric,
-      instructionsHtml,
-      rubricHtml,
-    });
+    ok(res, { data: json });
   } catch (err) {
-    console.error("Generate error:", err);
-    res.status(500).json({ ok: false, error: err.message || "Generate failed" });
+    fail(res, 500, "Server error in /api/generate", { message: err.message });
   }
 });
 
-// -------------------- AI: ANALYZE (validity + washback + improved versions) --------------------
-app.post("/api/analyze", requireGroq, async (req, res) => {
+/**
+ * Scan + improve EXISTING assessment (your "Scan" mode)
+ * Expects:
+ * {
+ *   "meta": { framework, level, skill, purpose },
+ *   "instructions": "text...",
+ *   "rubric": "text..."
+ * }
+ */
+app.post("/api/analyze", async (req, res) => {
   try {
-    const meta = req.body?.meta || {};
-    const instructionsText = req.body?.instructionsText || "";
-    const rubricText = req.body?.rubricText || "";
-    const assessmentText = req.body?.assessmentText || "";
+    if (!requireGroq(res)) return;
 
-    const system = `
-You are an assessment specialist (validity, reliability, practicality, fairness, washback).
-Return ONLY valid JSON.
-You must:
-1) Analyze the provided assessment + rubric for: validity, reliability, fairness, practicality, washback, clarity, alignment.
-2) Provide a clear, teacher-friendly report with bullet points and actionable fixes.
-3) Provide improved "better" versions of instructions and rubric (structured rubric format).
-JSON only; no markdown fences.
-`;
+    const meta = req.body?.meta || {};
+    const instructions = (req.body?.instructions || "").toString();
+    const rubric = (req.body?.rubric || "").toString();
+
+    const framework = meta.framework || meta.levelFramework || "";
+    const level = meta.level || "";
+    const skill = meta.skill || "";
+    const purpose = meta.purpose || "";
 
     const user = `
-META:
-- skill: ${meta.skill || ""}
-- framework: ${meta.framework || ""}
-- level: ${meta.level || ""}
-- purpose: ${meta.purpose || ""}
-- assessmentType: ${meta.assessmentType || ""}
-- learningOutcomes: ${meta.learningOutcomes || ""}
+Analyze and improve the following ESL assessment materials.
 
-ASSESSMENT TEXT:
-${assessmentText}
+Context:
+- Skill: ${skill}
+- Framework: ${framework}
+- Level: ${level}
+- Purpose: ${purpose}
 
-INSTRUCTIONS TEXT:
-${instructionsText}
+EXISTING INSTRUCTIONS:
+${instructions}
 
-RUBRIC TEXT:
-${rubricText}
+EXISTING RUBRIC:
+${rubric}
 
-Return JSON:
-{
-  "scores": {"validity": 0-10, "reliability":0-10, "fairness":0-10, "practicality":0-10, "washback":0-10, "clarity":0-10, "alignment":0-10},
-  "strengths": ["..."],
-  "risks": ["..."],
-  "fixes": [{"issue":"...", "whyItMatters":"...", "quickFix":"..."}],
-  "improvedInstructionsText":"...",
-  "improvedRubric": { "title":"...", "criteria":[ ...same structure as /api/generate... ] }
-}
+Tasks:
+1) Score and explain: alignment, construct validity, content validity, fairness/accessibility, washback, practicality, reliability proxy.
+2) Identify concrete issues with evidence and fixes.
+3) Produce improved versions:
+   - Professional student instructions (clean headings and bullets)
+   - Professional rubric as a table (4 bands, observable descriptors)
+
+${ANALYZE_SCHEMA}
 `;
 
-    const raw = await groqChat({ system, user, temperature: 0.2, max_tokens: 2600 });
+    const { raw, json } = await callGroqJson({
+      system: SYSTEM_JSON_ONLY,
+      user,
+      temperature: 0.2,
+    });
 
-    const jsonStart = raw.indexOf("{");
-    const jsonEnd = raw.lastIndexOf("}");
-    const slice = jsonStart >= 0 && jsonEnd >= 0 ? raw.slice(jsonStart, jsonEnd + 1) : raw;
-    const parsed = safeJsonParse(slice);
-
-    if (!parsed?.scores || !parsed?.improvedRubric || !parsed?.improvedInstructionsText) {
-      return res.status(502).json({
-        ok: false,
-        error: "Model did not return valid JSON. Try again.",
-        raw,
-      });
+    if (!json) {
+      return fail(res, 502, "Model did not return valid JSON.", { raw });
     }
 
-    const improvedInstructionsHtml = buildInstructionsHTML(meta, parsed.improvedInstructionsText);
-    const improvedRubricHtml = buildRubricTableHTML(parsed.improvedRubric);
-
-    // Simple teacher report HTML (frontend can style it)
-    const reportHtml = `
-      <div class="report">
-        <h2>Validity & Washback Report</h2>
-        <div class="scores">
-          ${Object.entries(parsed.scores)
-            .map(([k, v]) => `<div class="pill"><strong>${escapeHtml(k)}</strong>: ${escapeHtml(v)}</div>`)
-            .join("")}
-        </div>
-
-        <h3>Strengths</h3>
-        <ul>${(parsed.strengths || []).map((s) => `<li>${escapeHtml(s)}</li>`).join("")}</ul>
-
-        <h3>Risks</h3>
-        <ul>${(parsed.risks || []).map((s) => `<li>${escapeHtml(s)}</li>`).join("")}</ul>
-
-        <h3>Fixes (actionable)</h3>
-        <ol>
-          ${(parsed.fixes || [])
-            .map(
-              (f) => `<li>
-                <div><strong>Issue:</strong> ${escapeHtml(f.issue || "")}</div>
-                <div><strong>Why it matters:</strong> ${escapeHtml(f.whyItMatters || "")}</div>
-                <div><strong>Quick fix:</strong> ${escapeHtml(f.quickFix || "")}</div>
-              </li>`
-            )
-            .join("")}
-        </ol>
-      </div>
-    `;
-
-    res.json({
-      ok: true,
-      meta,
-      report: parsed,
-      reportHtml,
-      improvedInstructionsHtml,
-      improvedRubricHtml,
-    });
+    ok(res, { data: json });
   } catch (err) {
-    console.error("Analyze error:", err);
-    res.status(500).json({ ok: false, error: err.message || "Analyze failed" });
+    fail(res, 500, "Server error in /api/analyze", { message: err.message });
   }
 });
 
-// -------------------- 404 catch --------------------
+// 404
 app.use((req, res) => {
-  res.status(404).json({ ok: false, error: "Route not found" });
+  fail(res, 404, "Route not found");
 });
 
-// -------------------- error handler --------------------
-app.use((err, req, res, next) => {
-  console.error("Server error:", err);
-  res.status(500).json({ ok: false, error: "Internal server error" });
-});
-
-// -------------------- start --------------------
-const PORT = process.env.PORT || 3000;
 app.listen(PORT, () => {
   console.log(`🚀 Server running on port ${PORT}`);
-  console.log("ADMIN_KEY set:", Boolean(process.env.ADMIN_KEY));
-  console.log("GROQ_API_KEY set:", Boolean(process.env.GROQ_API_KEY));
+  console.log("GROQ_API_KEY set:", Boolean(GROQ_KEY));
 });
